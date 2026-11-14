@@ -1,0 +1,263 @@
+# Controller pod: munged + slurmctld + sshd. This pod is the one place where
+# SLURM's setuid-free design is worth spelling out: with Slurm 24.05+ every
+# daemon runs as a plain uid, sshd itself runs as aiida and can only spawn
+# sessions as aiida, and nothing binds a privileged port inside the pod, so
+# the restricted PSS holds with no exceptions.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: slurmctld
+  namespace: slurm
+  labels:
+    app.kubernetes.io/name: slurm
+    app.kubernetes.io/component: controller
+    app.kubernetes.io/part-of: aiidalab-openclaw-demo
+spec:
+  replicas: 1
+  serviceName: slurmctld
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: slurm
+      app.kubernetes.io/component: controller
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: slurm
+        app.kubernetes.io/component: controller
+        app.kubernetes.io/part-of: aiidalab-openclaw-demo
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      initContainers:
+      - name: munge-key-setup
+        image: sandbox.local/slurm:26.05.5
+        imagePullPolicy: IfNotPresent
+        # The manifest activation unit creates the slurm/munge-key Secret from
+        # the runtime dotenv (MUNGE_KEY_B64); kubelet applies fsGroup to the
+        # mounted files (0440 root:1000), so the init container reads it
+        # as group 1000 and hands munged a key that is 0400 and owned by uid 998.
+        command: ["bash", "-c", "install -Dm0400 /munge-src/munge.key /var/munge-rt/munge/munge.key"]
+        securityContext:
+          runAsUser: 998
+          runAsGroup: 1000
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: [ALL]
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - name: munge-key
+          mountPath: /munge-src
+          readOnly: true
+        - name: munge-rt
+          mountPath: /var/munge-rt
+      - name: ssh-host-keys
+        image: sandbox.local/slurm:26.05.5
+        imagePullPolicy: IfNotPresent
+        # The keys live on the state volume, not in an emptyDir: a new host key
+        # on every start breaks the known_hosts the AiiDA profile pins, and the
+        # node would have to be re-scanned after each restart.
+        command:
+          - bash
+          - -c
+          - |
+            install -d -m0700 /var/spool/slurmctld/ssh
+            for t in ed25519 rsa; do
+              k=/var/spool/slurmctld/ssh/ssh_host_${t}_key
+              [ -s "$k" ] || ssh-keygen -q -t "$t" -N '' -f "$k"
+            done
+            install -d -m0755 /scratch/aiida
+        securityContext:
+          runAsUser: 1000
+          runAsGroup: 1000
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: [ALL]
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - name: slurm-state
+          mountPath: /var/spool/slurmctld
+        - name: scratch
+          mountPath: /scratch
+      # The local-path volume is world-writable, which slurmctld rejects, and
+      # the container cannot chmod a root-owned mount point; it gets a state
+      # directory of its own instead.
+      - name: state-setup
+        image: sandbox.local/slurm:26.05.5
+        imagePullPolicy: IfNotPresent
+        command: ["bash", "-c", "install -d -m0700 /var/spool/slurmctld/state"]
+        securityContext:
+          runAsUser: 1000
+          runAsGroup: 1000
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: [ALL]
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - name: slurm-state
+          mountPath: /var/spool/slurmctld
+      containers:
+      - name: munged
+        image: sandbox.local/slurm:26.05.5
+        imagePullPolicy: IfNotPresent
+        # The supervisor is what makes a munge-key rotation survivable: munged
+        # keeps the key it read at startup, so a new Secret stays invisible
+        # until the process restarts. The wrapper watches the mounted key and
+        # restarts munged when it changes, in this pod and in the compute pod,
+        # so neither side ever needs a hand-ordered restart. See
+        # 05-slurm-scripts.yaml for the script.
+        #
+        # --force: the pod emptyDir is group-writable by kubelet design, and
+        # munged treats every writable-but-not-sticky ancestor as a fatal error.
+        command: ["bash", "/etc/slurm-scripts/munged-supervisor.sh",
+          "munged", "-F", "--force",
+          "--socket=/var/munge-rt/munge/munge.socket.2",
+          "--key-file=/var/munge-rt/munge/munge.key",
+          "--pid-file=/var/munge-rt/munge/munged.pid",
+          "--seed-file=/var/munge-rt/munge/munged.seed",
+          "--log-file=/var/munge-rt/munge/munged.log",
+          "--num-threads=10"]
+        securityContext:
+          runAsUser: 998
+          runAsGroup: 1000
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: [ALL]
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - name: munge-rt
+          mountPath: /var/munge-rt
+        - name: munge-key
+          mountPath: /munge-src
+          readOnly: true
+        - name: slurm-scripts
+          mountPath: /etc/slurm-scripts
+          readOnly: true
+        readinessProbe:
+          exec:
+            command: ["test", "-S", "/var/munge-rt/munge/munge.socket.2"]
+          initialDelaySeconds: 3
+          periodSeconds: 5
+      - name: slurmctld
+        image: sandbox.local/slurm:26.05.5
+        imagePullPolicy: IfNotPresent
+        command: ["slurmctld", "-D", "-f", "/etc/slurm/slurm.conf"]
+        securityContext:
+          runAsUser: 1000
+          runAsGroup: 1000
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: [ALL]
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - name: slurm-conf
+          mountPath: /etc/slurm
+          readOnly: true
+        - name: munge-rt
+          mountPath: /var/munge-rt
+        - name: slurm-state
+          mountPath: /var/spool/slurmctld
+        resources:
+          requests:
+            cpu: 250m
+            memory: 512Mi
+        ports:
+        - name: slurmctld
+          containerPort: 6817
+          protocol: TCP
+        readinessProbe:
+          exec:
+            command: ["scontrol", "ping"]
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          failureThreshold: 30
+        livenessProbe:
+          exec:
+            command: ["scontrol", "ping"]
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          failureThreshold: 5
+      - name: sshd
+        image: sandbox.local/slurm:26.05.5
+        imagePullPolicy: IfNotPresent
+        command: ["/bin/sshd", "-De", "-f", "/etc/sshconf/sshd_config"]
+        securityContext:
+          runAsUser: 1000
+          runAsGroup: 1000
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: [ALL]
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        # AiiDA sessions run sbatch/squeue: they resolve the compiled default
+        # /etc/slurm/slurm.conf and the munge socket via AuthInfo inside it.
+        - name: slurm-conf
+          mountPath: /etc/slurm
+          readOnly: true
+        - name: ssh-config
+          mountPath: /etc/sshconf
+          readOnly: true
+        - name: slurm-state
+          mountPath: /var/spool/slurmctld
+          readOnly: true
+        - name: ssh-auth
+          mountPath: /etc/auth
+          readOnly: true
+        - name: munge-rt
+          mountPath: /var/munge-rt
+        - name: scratch
+          mountPath: /scratch
+        - name: tmp
+          mountPath: /tmp
+        resources:
+          requests:
+            cpu: 50m
+            memory: 128Mi
+        ports:
+        - name: ssh
+          containerPort: 2222
+          protocol: TCP
+        readinessProbe:
+          exec:
+            command: ["bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/2222"]
+          initialDelaySeconds: 3
+          periodSeconds: 5
+      volumes:
+      - name: munge-key
+        secret:
+          secretName: munge-key
+          defaultMode: 0400
+      - name: slurm-scripts
+        configMap:
+          name: slurm-scripts
+          defaultMode: 0555
+      - name: slurm-conf
+        configMap:
+          name: slurm-conf
+      - name: ssh-auth
+        secret:
+          secretName: slurm-ssh
+          defaultMode: 0400
+      - name: ssh-config
+        configMap:
+          name: slurm-conf
+          items:
+          - key: sshd_config
+            path: sshd_config
+      - name: munge-rt
+        emptyDir: {}
+      - name: ssh-hostkeys
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}
+      - name: slurm-state
+        persistentVolumeClaim:
+          claimName: slurm-state
+      - name: scratch
+        persistentVolumeClaim:
+          claimName: slurm-scratch

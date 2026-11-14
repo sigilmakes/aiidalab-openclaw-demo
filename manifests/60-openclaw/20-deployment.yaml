@@ -1,0 +1,286 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openclaw
+  namespace: openclaw
+  labels:
+    app.kubernetes.io/name: openclaw
+    app.kubernetes.io/component: gateway
+    app.kubernetes.io/version: "2026.10.7"
+    app.kubernetes.io/part-of: aiidalab-openclaw-demo
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: openclaw
+      app.kubernetes.io/component: gateway
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: openclaw
+        app.kubernetes.io/component: gateway
+        app.kubernetes.io/part-of: aiidalab-openclaw-demo
+      annotations:
+        # Filled by render.nix from the image derivation. Changing the image
+        # changes the pod template and rolls the pod; an unchanged image does
+        # not restart the gateway.
+        demo.local/openclaw-image: "@OPENCLAW_IMAGE_CHECKSUM@"
+    spec:
+      serviceAccountName: openclaw-ops
+      automountServiceAccountToken: true
+      terminationGracePeriodSeconds: 90
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+      # A PVC mounted at /nix would hide the image's own store, including the
+      # gateway binary and the portal-bridge Python. Seed the PVC from the image
+      # first, then let the main containers mount it at /nix.
+      - name: seed-nix-store
+        image: sandbox.local/openclaw:2026.10.7
+        imagePullPolicy: IfNotPresent
+        command: ["/bin/bash", "-lc"]
+        args:
+        - |
+          set -euo pipefail
+          install -d -m 0755 /nix-pvc/store /nix-pvc/var/nix/db             /nix-pvc/var/nix/profiles /nix-pvc/var/nix/gcroots /nix-pvc/var/nix/temproots
+          rsync -a --ignore-existing --no-owner --no-group /nix/store/ /nix-pvc/store/
+          rsync -a --ignore-existing --no-owner --no-group /nix/var/nix/ /nix-pvc/var/nix/
+          chmod u+w /nix-pvc/store
+          chmod -R u+rwX /nix-pvc/var/nix
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: [ALL]
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - name: nix
+          mountPath: /nix-pvc
+        - name: tmp
+          mountPath: /tmp
+      - name: prepare-state
+        image: sandbox.local/openclaw:2026.10.7
+        imagePullPolicy: IfNotPresent
+        command:
+        - /bin/sh
+        - -c
+        - mkdir -p /srv/openclaw/tmp/nix /srv/openclaw/cache /srv/openclaw/config /srv/openclaw/data
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: [ALL]
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - name: state
+          mountPath: /srv/openclaw
+      containers:
+      # The gateway's portal listener binds 127.0.0.1:18790 inside the gateway
+      # container, by design ("private HTTPS wildcard proxy forwarding to a
+      # dedicated loopback listener"). cloudflared runs in another namespace, so
+      # it cannot reach that address; this relay listens on the pod network and
+      # forwards to the loopback port. It listens on 18791, not 18790, because
+      # binding 0.0.0.0:18790 in the same netns collides with the existing
+      # 127.0.0.1:18790 bind.
+      - name: portal-bridge
+        image: sandbox.local/openclaw:2026.10.7
+        imagePullPolicy: IfNotPresent
+        command:
+        - /usr/bin/env
+        - python3
+        - -c
+        - |
+          import socket, threading
+
+          LISTEN, TARGET = ("0.0.0.0", 18791), ("127.0.0.1", 18790)
+
+          def pump(src, dst):
+              try:
+                  while True:
+                      data = src.recv(65536)
+                      if not data:
+                          break
+                      dst.sendall(data)
+              except OSError:
+                  pass
+              finally:
+                  for sock in (src, dst):
+                      try:
+                          sock.shutdown(socket.SHUT_RDWR)
+                      except OSError:
+                          pass
+
+          def handle(client):
+              upstream = socket.create_connection(TARGET, timeout=10)
+              threading.Thread(target=pump, args=(client, upstream), daemon=True).start()
+              pump(upstream, client)
+
+          server = socket.socket()
+          server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+          server.bind(LISTEN)
+          server.listen(64)
+          while True:
+              client, _ = server.accept()
+              threading.Thread(target=handle, args=(client,), daemon=True).start()
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - name: nix
+          mountPath: /nix
+        ports:
+        - name: portal
+          containerPort: 18791
+          protocol: TCP
+      - name: gateway
+        image: sandbox.local/openclaw:2026.10.7
+        imagePullPolicy: IfNotPresent
+        args:
+        - gateway
+        - run
+        - --bind
+        - custom
+        - --port
+        - "18789"
+        # Password auth for the Control UI. `--auth token` here would override
+        # the configured mode and make the gateway demand a token the UI never
+        # prompts for.
+        - --auth
+        - password
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          readOnlyRootFilesystem: true
+        lifecycle:
+          postStart:
+            exec:
+              command:
+              - /bin/bash
+              - -lc
+              - nix-store --load-db < /etc/nix/openclaw-registration || echo "nix store registration failed" >&2
+        ports:
+        - name: gateway
+          containerPort: 18789
+          protocol: TCP
+        env:
+        # Control UI password. openclaw.json references this variable through
+        # a SecretRef, so the value never appears in the ConfigMap. Rotate it
+        # in the runtime dotenv (CLAW_GATEWAY_TOKEN) and rollout restart; paired
+        # browsers keep their device token and only have to log in again.
+        - name: OPENCLAW_GATEWAY_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: openclaw-gateway
+              key: OPENCLAW_GATEWAY_PASSWORD
+        - name: OPENCLAW_NIX_MODE
+          value: "0"
+        # Virtual key minted by Bifrost; openclaw.json references it as
+        # ${BIFROST_VK} so the secret never lands in the ConfigMap.
+        - name: BIFROST_VK
+          valueFrom:
+            secretKeyRef:
+              name: bifrost-vk
+              key: BIFROST_VK
+        # Bearer token for the aiida-mcp endpoint (team-aiida). The token is
+        # interpolated into the MCP header in openclaw.json as
+        # "Bearer ${AIIDA_MCP_TOKEN}", so it never lands in the ConfigMap.
+        - name: AIIDA_MCP_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: aiida-mcp-client
+              key: token
+        volumeMounts:
+        - name: state
+          mountPath: /srv/openclaw
+        - name: nix
+          mountPath: /nix
+        - name: config
+          mountPath: /etc/openclaw
+          readOnly: true
+        - name: skills
+          mountPath: /etc/openclaw/skills
+          readOnly: true
+        - name: tmp
+          mountPath: /tmp
+        # Probes hit /health, which reports process state rather than mere
+        # port acceptance. /health is intentionally unauthenticated so kubelet
+        # can call it; it returns only {"ok":true,"status":"live"}.
+        # 90 * 2s = 3 minutes was shorter than the gateway's own shutdown budget
+        # (drain 315s). With strategy Recreate the old pod is terminated first, so
+        # a stacked roll left the new pod waiting on the state lock while the old
+        # one drained: three minutes of "connection refused" on /health and the
+        # deployment at zero available. 240 * 2s = 8 minutes covers the drain.
+        startupProbe:
+          httpGet:
+            path: /health
+            port: gateway
+          periodSeconds: 2
+          failureThreshold: 240
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: gateway
+          periodSeconds: 10
+          failureThreshold: 6
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: gateway
+          periodSeconds: 15
+          failureThreshold: 4
+        resources:
+          requests:
+            cpu: 500m
+            memory: 2Gi
+          limits:
+            cpu: "4"
+            memory: 12Gi
+      volumes:
+      - name: state
+        persistentVolumeClaim:
+          claimName: openclaw-state
+      - name: nix
+        persistentVolumeClaim:
+          claimName: openclaw-nix
+      - name: config
+        configMap:
+          name: openclaw-config
+          # Contains no secrets, still not world readable (doctor flags 0644).
+          defaultMode: 0440
+      - name: skills
+        projected:
+          defaultMode: 0440
+          sources:
+          - configMap:
+              name: openclaw-skills
+              items:
+              - key: aiida-notebook-SKILL.md
+                path: aiida-notebook/SKILL.md
+          - configMap:
+              name: openclaw-cluster-skills
+              items:
+              - key: cluster-nix-SKILL.md
+                path: cluster-nix/SKILL.md
+              - key: aiida-cli-SKILL.md
+                path: aiida-cli/SKILL.md
+              - key: slurm-cli-SKILL.md
+                path: slurm-cli/SKILL.md
+              - key: atomistic-dft-SKILL.md
+                path: atomistic-dft/SKILL.md
+              - key: cryoem-pipeliner-SKILL.md
+                path: cryoem-pipeliner/SKILL.md
+      - name: tmp
+        emptyDir:
+          sizeLimit: 256Mi

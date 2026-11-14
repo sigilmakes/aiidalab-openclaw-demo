@@ -1,0 +1,102 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: aiidalab-rabbitmq
+  namespace: aiidalab
+  labels:
+    app: aiidalab-rabbitmq
+spec:
+  selector:
+    app: aiidalab-rabbitmq
+  ports:
+    - name: amqp
+      port: 5672
+      targetPort: amqp
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: aiidalab-rabbitmq
+  namespace: aiidalab
+  labels:
+    app: aiidalab-rabbitmq
+spec:
+  serviceName: aiidalab-rabbitmq
+  replicas: 1
+  selector:
+    matchLabels:
+      app: aiidalab-rabbitmq
+  template:
+    metadata:
+      labels:
+        app: aiidalab-rabbitmq
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: rabbitmq
+          # The live broker is 4.1.4 and its data directory was created by 4.x.
+          # Downgrading to 3.9 against that volume is unsupported and would
+          # corrupt or refuse the store, so the tree follows the volume, not the
+          # other way round. aiida-core 2.9.4 nominally supports 3.8/3.9 only;
+          # that mismatch predates this file and is tracked separately.
+          image: rabbitmq:4.1.4
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            readOnlyRootFilesystem: true
+          env:
+            - name: RABBITMQ_DEFAULT_USER
+              value: aiida
+            - name: RABBITMQ_DEFAULT_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: aiidalab-rabbitmq
+                  key: RABBITMQ_PASSWORD
+            - name: RABBITMQ_ERLANG_COOKIE
+              valueFrom:
+                secretKeyRef:
+                  name: aiidalab-rabbitmq
+                  key: RABBITMQ_ERLANG_COOKIE
+          ports:
+            - name: amqp
+              containerPort: 5672
+          readinessProbe:
+            exec:
+              command: [rabbitmq-diagnostics, -q, ping]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "4"
+              memory: 4Gi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/rabbitmq
+            - name: etc
+              mountPath: /etc/rabbitmq
+            - name: log
+              mountPath: /var/log/rabbitmq
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: aiidalab-rabbitmq
+        - name: etc
+          emptyDir: {}
+        - name: log
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}

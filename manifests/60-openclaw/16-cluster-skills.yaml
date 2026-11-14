@@ -1,0 +1,399 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: openclaw-cluster-skills
+  namespace: openclaw
+  labels:
+    app.kubernetes.io/name: openclaw
+    app.kubernetes.io/part-of: aiidalab-openclaw-demo
+data:
+  cluster-nix-SKILL.md: |
+    ---
+    name: cluster-nix
+    description: Use the writable Nix store inside the OpenClaw pod to pull throwaway CLI tools with nix-shell / nix shell. Use when a command is missing in the gateway. The AiiDA/SLURM pods have no Nix store; install missing deps there with their own toolchains.
+    ---
+    
+    # Nix store in the OpenClaw pod
+    
+    The OpenClaw gateway container has a writable `/nix` store and the `nix` CLI.
+    Use it for short-lived tooling in THIS pod only. jq, yq, ripgrep, git, curl and
+    a Python/uv toolchain are already in the image; reach for Nix only when a task
+    needs something else (a missing CLI, a one-off parser, a debug utility).
+    
+    ## When to use
+    - A command the task needs is missing from the gateway image and the work runs
+      inside the gateway container.
+    - A quick, disposable tool you can drop afterwards.
+    
+    ## How to run
+    - `nix-shell -p <pkg> --run '<cmd>'` — the image pins `NIX_PATH` to the
+      flake's nixpkgs source, so this is reproducible without a network fetch of
+      the channel.
+    - `nix shell nixpkgs#<pkg> -c <cmd>` only if the registry has a pinned
+      `nixpkgs` entry; otherwise use `nix-shell -p`.
+    - The store is the footprint; `nix-shell` does not create a profile.
+    
+    ## Pin nixpkgs
+    - The image's `NIX_PATH` points at the exact nixpkgs source this repository's flake
+      pins. Do not replace it with a moving `nixpkgs-unstable` channel.
+    - If you must use another revision, record the full commit in your reply and
+      fetch it explicitly; do not silently drift.
+    
+    ## TMPDIR
+    - The image sets `TMPDIR=/srv/openclaw/tmp/nix`, on the state PVC. The pod's
+      init container creates it. Do not point `TMPDIR` at `/tmp`; that is a 256 MiB
+      emptyDir and large builds will fail.
+    
+    ## Garbage collection
+    - The writable store fills up. After experiments run `nix-collect-garbage -d`
+      (and `nix store gc`) to reclaim space.
+    - Never GC while another build is running in the pod.
+    
+    ## Other pods
+    The AiiDA and SLURM pods are Nix-built, read-only-rootfs, run as uid 1000,
+    and have no `/nix` store or `nix` binary. You may exec into them to add
+    user-level dependencies with their own toolchains (for example
+    `pip install --user` or `uv`) when a task needs it; `kubectl cp` moves files.
+    For a persistent change, rebuild the image from this repository and redeploy.
+    
+    ## Housekeeping
+    - Prefer the image's toolchain; use Nix only when a tool is missing.
+    - For Python project work use `uv` inside the container; keep the Nix store
+      for CLI tools.
+    - Treat the store as scratch, not durable state.
+
+  aiida-cli-SKILL.md: |
+    ---
+    name: aiida-cli
+    description: Run verdi commands against the AiiDA profile through the aiida-ops-0 pod. Use for inspection, code and computer checks, and direct CLI work. The MCP tools are the structured demo path; they do not gate the CLI.
+    ---
+    
+    # AiiDA CLI (ops pod)
+    
+    The ops pod (`aiida-ops-0` in namespace `aiidalab`) holds the lab venv and the
+    default profile `aiidalab`. You have exec permission on it. Use `verdi`
+    directly for inspection, cross-checks, and operations that the MCP surface
+    does not cover. The MCP tools are a convenience, not a restriction.
+    
+    ## Command shape
+    ```
+    kubectl exec -n aiidalab aiida-ops-0 -- verdi <command>
+    ```
+    `verdi` runs with `HOME=/home/aiida` and the default profile. If a command
+    complains about the profile, prefix it: `verdi -p aiidalab <command>`.
+    
+    ## Useful commands
+    - `verdi process list -a` — all processes (pk, state, exit status).
+    - `verdi process show <pk>` — one process: inputs, outputs, state.
+    - `verdi process report <pk>` — the log report (why a process failed).
+    - `verdi code list` — configured codes, including the `pw.x@slurm-local` full
+      label used as a `{"label": ...}` reference in submissions.
+    - `verdi computer list` — configured computers.
+    - `verdi computer test slurm-local` — SSH + scheduler connectivity test against
+      the in-cluster SLURM.
+    - `verdi daemon status` — whether the daemon is running and has pending work.
+    - `verdi run`, `verdi shell`, `verdi process launch` — direct submission and
+      interactive work. Allowed.
+    
+    ## Submission
+    You may submit through the CLI. For the demo path, prefer
+    `aiida__submit_process_spec` (or the pane tool `aiida__aiidalab_run`) so the
+    process is structured and visible. If you submit with `verdi`, report the pk
+    and the command you used. If you create or store nodes with `verdi`, that is
+    allowed; report what you stored.
+    
+    ## Missing dependencies
+    The pod runs as uid 1000. If a command is missing, install user-level
+    dependencies with the pod's toolchain (for example `pip install --user` or
+    `uv`) and say what you installed. For a persistent change, rebuild the image
+    from this repository and redeploy.
+    
+    ## Boundaries
+    - Do not read or print secrets (database password, SSH keys, Jupyter token)
+      from the pod.
+    - For structured history, MCP `aiida__list_recent_processes` /
+      `aiida__query_nodes` is convenient; `verdi process list` is fine for a
+      quick look.
+
+  slurm-cli-SKILL.md: |
+    ---
+    name: slurm-cli
+    description: Use the sandbox SLURM CLI directly (sinfo/squeue/scontrol/sbatch/scancel) through the slurmctld-0 sshd container. Use for queue and node state AiiDA does not expose, and for direct scheduler work when needed.
+    ---
+    
+    # SLURM CLI (slurmctld-0 sshd container)
+    
+    The controller pod's `sshd` container mounts `/etc/slurm/slurm.conf` and the
+    munge socket, so its client commands resolve the controller directly. You
+    have exec permission on it.
+    
+    ## Command shape
+    ```
+    kubectl exec -n slurm slurmctld-0 -c sshd -- <slurm-command>
+    ```
+    
+    ## Cluster shape
+    - One controller (`slurmctld-0`) and one compute node `compute01` (8 CPUs).
+    - Partitions: `debug` (default) and `batch`.
+    - Everything runs as uid 1000 (`aiida`); slurmd is rootless.
+    
+    ## Inspection
+    - `sinfo` — partitions and node state.
+    - `sinfo -N -l` — per-node detail.
+    - `squeue` — queued and running jobs.
+    - `squeue -u aiida` — jobs the AiiDA user has in flight.
+    - `scontrol show node compute01` — node state and reasons.
+    - `scontrol show partition` — partition settings.
+    - `scontrol show job <jobid>` — one job's state/exit code.
+    - `scontrol ping` — controller liveness.
+    
+    ## Mutations
+    You are allowed to use these directly.
+    - `scancel <jobid>` — cancel one job. A bare `scancel` leaves AiiDA to mark
+      the calcjob failed/killed on its next update; cancel through AiiDA's view
+      when the job is AiiDA-managed.
+    - `sbatch <script>` — submit a job directly. Jobs submitted this way do not
+      appear in AiiDA history; report the job id and how to inspect it.
+    - `scontrol update`, `scontrol requeue`, `scontrol hold`/`release` — mutate
+      the queue or node state when the task needs it. State the intent and report
+      what changed.
+    
+    ## sacct has no accounting database
+    - `sacct` returns nothing here: the sandbox slurm.conf sets no
+      AccountingStorageType. Use `squeue` / `scontrol show job` for live state.
+    - For AiiDA history use `verdi process list` via the ops pod, or MCP
+      `aiida__list_recent_processes`.
+    
+    ## Boundaries
+    - Do not print munge or sshd keys. Do not delete the munge socket or keys.
+    - The pod runs as uid 1000; you cannot install system packages there. Use
+      user-level tools or the container's existing toolchain.
+
+  atomistic-dft-SKILL.md: |
+    ---
+    name: atomistic-dft
+    description: End-to-end AiiDA + Quantum ESPRESSO recipe through the live aiida__ MCP tools. Build a structure, kpoints and pseudos, submit pw.x to slurm-local, poll, and read aiida.out. Use for DFT (SCF/relax/bands) submissions.
+    ---
+    
+    # AiiDA / Quantum ESPRESSO recipe (MCP)
+    
+    This is the structured MCP recipe for the demo path. The `aiida-cli` and
+    `slurm-cli` skills give direct CLI access; use them when that is the better
+    tool.
+    
+    This is a recipe, not a record of a run. Never say a calculation succeeded
+    unless you observed a finished process with exit_status 0 from
+    `aiida__wait_for_process` or `aiida__get_process_status`.
+    
+    The AiiDA tools are exposed with an `aiida__` prefix. Use only these tool
+    names; never invent one.
+    
+    ## Step 0 — discover code and pseudopotentials
+    - `aiida__list_codes(entry_point="quantumespresso.pw")` -> records with
+      `full_label` (e.g. `pw.x@slurm-local`). Use that label verbatim as the code
+      reference `{"label": "<full_label>"}`.
+    - `aiida__query_nodes({"entity_type": "UpfData", "group_label": "SSSP/1.3/PBE/efficiency", "project": ["pk", "attributes.element", "filename"]})`
+      -> the SSSP pseudopotential pks. The PseudoPotentialData `label` is often
+      empty; use `attributes.element` (for example `Si`) to pick the pk. Never
+      guess a pseudo pk.
+    
+    ## Step 1 — structure
+    Create it, or reuse an existing one:
+    - `aiida__create_structure(species=["Si", "Si"], positions=[[0.0,0.0,0.0],[1.3575,1.3575,1.3575]], cell=[[0.0,2.715,2.715],[2.715,0.0,2.715],[2.715,2.715,0.0]], name="silicon")` -> `pk`.
+    - Or reuse: `aiida__search_structures("Si")` -> an existing StructureData pk.
+    Positions and cell are Cartesian in angstrom.
+    
+    ## Step 2 — kpoints
+    - `aiida__create_kpoints(mesh=[6,6,6])` -> `pk` (mesh form).
+    - Or by density: `aiida__create_kpoints(distance=0.25, structure=<structure_pk>)`.
+    
+    ## Step 3 — submit the spec
+    The `123`/`124`/`125` pks below are placeholders: substitute the real pks
+    returned by Steps 0-2.
+    ```json
+    {
+      "entry_point": "quantumespresso.pw",
+      "inputs": {
+        "code": {"label": "pw.x@slurm-local"},
+        "structure": {"pk": 123},
+        "kpoints": {"pk": 124},
+        "pseudos": {"Si": {"pk": 125}},
+        "parameters": {
+          "CONTROL": {"calculation": "scf", "verbosity": "high",
+                      "etot_conv_thr": 1.0e-5, "forc_conv_thr": 1.0e-4,
+                      "tstress": true, "tprnfor": true},
+          "SYSTEM": {"ecutwfc": 40, "ecutrho": 320,
+                     "occupations": "smearing", "smearing": "cold",
+                     "degauss": 0.01},
+          "ELECTRONS": {"conv_thr": 1.0e-8, "mixing_beta": 0.7}
+        },
+        "metadata": {
+          "options": {
+            "resources": {"num_machines": 1, "num_mpiprocs_per_machine": 4},
+            "max_wallclock_seconds": 1800,
+            "import_sys_environment": false
+          }
+        }
+      }
+    }
+    ```
+    - `parameters` is a plain namelist dict; the server wraps it into a Dict.
+    - `structure`, `kpoints`, `pseudos.<element>` and `code` are node references.
+    - `resources`: compute01 has 8 CPUs on one node; keep
+      `num_mpiprocs_per_machine` <= 8. This is a sensible SCF default, not the
+      SSSP family's authoritative cutoff — run the pre-check below.
+    - `import_sys_environment` MUST be false. slurmd is rootless and refuses the
+      `--get-user-env` directive AiiDA emits when it is true; the MCP server
+      rejects a spec that sets it true.
+    - Optional pre-check: `aiida__check_cutoffs_against_pseudos(spec)` before
+      submitting; it warns when `ecutwfc`/`ecutrho` disagree with the family.
+    - For an insulator you may use `"occupations": "fixed"` instead of smearing.
+    
+    ## Forbidden scheduler fields (the server refuses these)
+    Do not set in `metadata.options`: `append_text`, `prepend_text`,
+    `custom_scheduler_commands`, `environment_variables`, `scheduler_stdout`,
+    `scheduler_stderr`, `submit_script_filename`, `mpirun_extra_params`.
+    Do not set `settings.CMDLINE` (or `settings.cmdline`).
+    
+    ## Step 4 — submit
+    - `aiida__submit_process_spec(spec)` -> `pk`, `uuid`, `url`.
+    - The submit tool auto-writes the repro notebook and returns its absolute
+      `url`. Report that url (see the aiida-notebook skill for link rules).
+    - If the result carries `repro_notebook_required`, the process exists but the
+      notebook does not: call `aiida__write_notebook("<pk>-<label>", cells, title)`
+      yourself, then report that url.
+    - If a submitted process stays "created", check `aiida__get_daemon_status()`.
+    
+    ## Step 5 — poll and read evidence
+    - `aiida__wait_for_process(identifier="<pk>", timeout_seconds=600)` -> branch on
+      `terminated`. If false, the wait ran out and the process is still running:
+      say so, give the pk, and do not call it a failure or a hang.
+    - `aiida__aiidalab_tail(ref={"pk": <pk>})` -> scheduler tail, process report and
+      the `aiida.out` tail in one call. Use `follow=true` (with `follow_seconds`)
+      to block briefly while it finishes.
+    - `aiida__get_retrieved_file(identifier="<pk>", filename="aiida.out", tail_lines=50)`
+      -> the code's own output; the final lines hold the SCF summary. Honour the
+      `truncated` flag and say so when you report a truncated file.
+    - `aiida__get_retrieved_file_head(identifier="<pk>", filename="aiida.out")` ->
+      the first lines (input echo). `aiida__export_process_files(pk=<pk>)` makes
+      the whole retrieved folder browsable.
+    - On failure, `aiida__diagnose_process_failure("<pk>")` before resubmitting.
+    
+    ## Repro notebook
+    - The submit tool writes it automatically; do not re-create it unless the
+      `repro_notebook_required` path fires. Follow the aiida-notebook skill for
+      naming (`<pk>-<label>`) and link format.
+    
+    ## Do not
+    - Do not set scheduler fields or `import_sys_environment=true`.
+    - Do not invent tool names, pseudo pks or code labels; discover them.
+    - Do not claim convergence from a truncated output or an unread `aiida.out`.
+    - For AiiDA submissions, the daemon owns the job. If you need direct
+      scheduler work, use the `slurm-cli` skill; `sbatch` is allowed there.
+
+  cryoem-pipeliner-SKILL.md: |
+    ---
+    name: cryoem-pipeliner
+    description: CPU-only CCP-EM Pipeliner/RELION/CTFFIND4 on the cryoem-ops pod in the slurm namespace. Use kubectl exec and run Pipeliner in the foreground; the tools and shared scratch PVC are already in the pod.
+    ---
+    
+    # Cryo-EM Pipeliner (CPU, cryoem-ops)
+    
+    `cryoem-ops-0` is a small submit host in the `slurm` namespace. Its image has
+    Pipeliner 1.6.1, RELION 5.1.x (CPU; the binary reports 5.1.0), and CTFFIND
+    4.1.14. The project lives on
+    the shared `cryoem-scratch` claim at `/scratch/cryoem`, and the pod has the
+    `openclaw-ops` exec permission. This is a foreground CPU path; no GPU steps.
+    `sbatch` from the pod is allowed for other work; this workflow runs in the
+    foreground because the compute image does not carry the conda env.
+    
+    ## Check first
+    ```bash
+    kubectl get pod -n slurm cryoem-ops-0
+    kubectl exec -n slurm cryoem-ops-0 -c cryoem -- bash -lc '
+      pipeliner --help >/dev/null && echo pipeliner-ok
+      relion_run_motioncorr --version
+      test -x /opt/ctffind/bin/ctffind && echo ctffind-ok
+    '
+    ```
+    If the pod is absent, say the cryo-EM service is unavailable. The AiiDA/SLURM
+    MCP tools do not replace this path.
+    
+    ## Upload movies
+    The pod and the OpenClaw image both have `tar`, so `kubectl cp` works:
+    ```bash
+    kubectl cp -n slurm ./movie.mrc cryoem-ops-0:/scratch/cryoem/uploads/movie.mrc -c cryoem
+    ```
+    Ask the user for the movie path first. Do not download a movie unless the user
+    asks; if you do, use the OpenClaw egress and keep it under /tmp.
+    
+    ## Run import -> motioncorr -> ctffind4
+    Write this to `/scratch/cryoem/run_demo.py` (use `kubectl exec -i ... -- sh -c
+    'cat > /scratch/cryoem/run_demo.py'`), then run it with `nohup` and poll the log.
+    Use one or a few movies; CPU motion correction of a 4K movie takes minutes.
+    
+    ```python
+    import os, shutil
+    from pathlib import Path
+    from pipeliner.api.manage_project import PipelinerProject
+    from pipeliner.api.api_utils import job_default_parameters_dict
+    
+    PROJ = Path("/scratch/cryoem/projects/demo")
+    PROJ.mkdir(parents=True, exist_ok=True)
+    movie = "/scratch/cryoem/uploads/movie.mrc"
+    (PROJ / "Movies").mkdir(exist_ok=True)
+    if not (PROJ / "Movies" / Path(movie).name).exists():
+        shutil.copy2(movie, PROJ / "Movies" / Path(movie).name)
+    
+    os.chdir(PROJ)
+    proj = PipelinerProject(make_new_project=True)
+    
+    def run(jobtype, overrides):
+        params = job_default_parameters_dict(jobtype)
+        params.update({"_rlnJobTypeLabel": jobtype, "_rlnJobIsContinue": "0", "_rlnJobIsTomo": "0"})
+        params.update(overrides)
+        job = proj.run_job(params, run_in_foreground=True)
+        print("finished", job.output_dir, flush=True)
+        return job
+    
+    imp = run("relion.import.movies", {
+        "fn_in_raw": "Movies/*", "angpix": "1.4", "kV": "300",
+        "Cs": "2.7", "Q0": "0.1", "is_multiframe": "Yes"})
+    moc = run("relion.motioncorr.own", {
+        "input_star_mics": str((PROJ / imp.output_dir / "movies.star").resolve()),
+        "first_frame_sum": "1", "last_frame_sum": "0", "bin_factor": "1",
+        "dose_per_frame": "1.0", "patch_x": "1", "patch_y": "1",
+        "nr_threads": "4", "nr_mpi": "1", "do_float16": "No",
+        "do_dose_weighting": "No"})
+    run("relion.ctffind.ctffind4", {
+        "input_star_mics": str((PROJ / moc.output_dir / "corrected_micrographs.star").resolve()),
+        "box": "512", "ctf_win": "-1", "resmin": "30", "resmax": "5",
+        "dfmin": "5000", "dfmax": "50000", "dfstep": "500", "nr_mpi": "1",
+    "use_given_ps": "Yes"})
+    ```
+    Start it in the background and return a log path:
+    ```bash
+    kubectl exec -n slurm cryoem-ops-0 -c cryoem -- bash -lc '
+      export HOME=/scratch/cryoem/home XDG_CONFIG_HOME=/scratch/cryoem/home/.config
+      cd /scratch/cryoem
+      nohup python /scratch/cryoem/run_demo.py >/scratch/cryoem/demo.log 2>&1 &
+      echo $!
+    '
+    ```
+    Poll with `kubectl exec ... -- tail -40 /scratch/cryoem/demo.log`. If a job
+    fails, read its `run.err` and `run.out`; do not claim success from a submitted
+    process alone. CTFFIND needs `use_given_ps=Yes` only when the motion-corrected
+    STAR points at float16 power spectra; the recipe above disables float16.
+    
+    ## Paths and limits
+    - Project root: `/scratch/cryoem/projects/<name>`.
+    - Scratch: `/scratch/cryoem/scratch`; uploads: `/scratch/cryoem/uploads`.
+    - Run as the pod's uid 1000; do not use sudo, apt, or a package manager.
+    - The image is CPU-only. A GPU recipe is out of scope.
+    - Slurm CLI access remains `slurmctld-0`; Pipeliner here runs foreground, not
+      through `sbatch`, because the compute image does not carry the conda env.
+    
+    ## Do not
+    - Do not claim a cryo-EM job ran if the pod or log is missing.
+    - Use this pod for the cryo-EM path; the MCP tools are not a substitute.
+    - Do not edit the image or the PVC ownership from this skill.

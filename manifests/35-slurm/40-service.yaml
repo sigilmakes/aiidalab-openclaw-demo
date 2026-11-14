@@ -1,0 +1,72 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: slurm
+  namespace: slurm
+  labels:
+    app.kubernetes.io/name: slurm
+    app.kubernetes.io/part-of: aiidalab-openclaw-demo
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: slurm
+    app.kubernetes.io/component: controller
+  ports:
+  # AiiDA transport: aiida@slurm.slurm.svc.cluster.local:22 -> sshd in-pod 2222
+  - name: ssh
+    port: 22
+    targetPort: 2222
+    protocol: TCP
+  # slurmctld RPC, for clients submitting from inside other namespaces
+  - name: slurmctld
+    port: 6817
+    targetPort: 6817
+    protocol: TCP
+---
+# Headless: SlurmctldHost=slurmctld must resolve to the controller POD address
+# (slurmctld binds the resolved IP; a ClusterIP would not work).
+apiVersion: v1
+kind: Service
+metadata:
+  name: slurmctld
+  namespace: slurm
+  labels:
+    app.kubernetes.io/name: slurm
+    app.kubernetes.io/part-of: aiidalab-openclaw-demo
+spec:
+  clusterIP: None
+  # The compute node cannot become Ready until the controller answers, and the
+  # controller cannot resolve the node until this name has an endpoint.
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: slurm
+    app.kubernetes.io/component: controller
+  ports:
+  - name: slurmctld
+    port: 6817
+    targetPort: 6817
+    protocol: TCP
+---
+# Headless: NodeAddr=slurmd must resolve to the compute pod so slurmctld can
+# reach it on 6818.
+apiVersion: v1
+kind: Service
+metadata:
+  name: slurmd
+  namespace: slurm
+  labels:
+    app.kubernetes.io/name: slurm
+    app.kubernetes.io/part-of: aiidalab-openclaw-demo
+spec:
+  clusterIP: None
+  # The compute node cannot become Ready until the controller answers, and the
+  # controller cannot resolve the node until this name has an endpoint.
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: slurm
+    app.kubernetes.io/component: compute01
+  ports:
+  - name: slurmd
+    port: 6818
+    targetPort: 6818
+    protocol: TCP

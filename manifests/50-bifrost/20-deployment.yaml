@@ -1,0 +1,166 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+    name: bifrost
+    namespace: bifrost
+    labels:
+        app.kubernetes.io/name: bifrost
+        app.kubernetes.io/component: model-gateway
+        app.kubernetes.io/part-of: aiidalab-openclaw-demo
+spec:
+    replicas: 1
+    # Single RWO PVC: re-create pods instead of rolling two mounts.
+    strategy:
+        type: Recreate
+    selector:
+        matchLabels:
+            app.kubernetes.io/name: bifrost
+    template:
+        metadata:
+            labels:
+                app.kubernetes.io/name: bifrost
+                app.kubernetes.io/component: model-gateway
+                app.kubernetes.io/part-of: aiidalab-openclaw-demo
+        spec:
+            automountServiceAccountToken: false
+            securityContext:
+                # Image runs as USER 1000:0; keep the numeric uid so kubelet can verify.
+                runAsNonRoot: true
+                runAsUser: 1000
+                runAsGroup: 0
+                fsGroup: 1000
+                fsGroupChangePolicy: OnRootMismatch
+                seccompProfile:
+                    type: RuntimeDefault
+            containers:
+                - name: bifrost
+                  # maximhq/bifrost latest, pinned 2026-10-29 (amd64; index sha256:f5b18826...)
+                  image: docker.io/maximhq/bifrost@sha256:d53775fd4b1d444c350443d2487ceb8aa8c0bab722cd5dc7b0001a7fa88ecd7f
+                  imagePullPolicy: IfNotPresent
+                  securityContext:
+                      allowPrivilegeEscalation: false
+                      capabilities:
+                          drop: [ALL]
+                      readOnlyRootFilesystem: true
+                  ports:
+                      - name: http
+                        containerPort: 8080
+                        protocol: TCP
+                  env:
+                      - name: GOOGLE_APPLICATION_CREDENTIALS
+                        value: /etc/gcp/credentials.json
+                      - name: VERTEX_PROJECT_ID
+                        valueFrom:
+                            configMapKeyRef:
+                                name: bifrost-config
+                                key: vertex-project
+                      # Unlocks the /api surface so a virtual key can be minted
+                      # for OpenClaw. Only the openclaw namespace can reach this
+                      # Service (30-netpol.yaml).
+                      - name: BIFROST_SETUP_TOKEN
+                        valueFrom:
+                            secretKeyRef:
+                                name: bifrost-setup
+                                key: token
+                      - name: VERTEX_REGION_CLAUDE
+                        valueFrom:
+                            configMapKeyRef:
+                                name: bifrost-config
+                                key: region-claude
+                      - name: VERTEX_REGION_GEMINI
+                        valueFrom:
+                            configMapKeyRef:
+                                name: bifrost-config
+                                key: region-gemini
+                  startupProbe:
+                      httpGet:
+                          path: /health
+                          port: http
+                      periodSeconds: 3
+                      failureThreshold: 40
+                  livenessProbe:
+                      httpGet:
+                          path: /health
+                          port: http
+                      periodSeconds: 15
+                      failureThreshold: 4
+                  readinessProbe:
+                      httpGet:
+                          path: /health
+                          port: http
+                      periodSeconds: 5
+                      failureThreshold: 3
+                  resources:
+                      requests:
+                          cpu: 100m
+                          memory: 256Mi
+                      limits:
+                          cpu: "2"
+                          memory: 1Gi
+                  volumeMounts:
+                      - name: bifrost-state
+                        mountPath: /app/data
+                      # File-level mount on top of the PVC; ConfigMap changes need a
+                      # pod restart (see 00-README.md).
+                      - name: bifrost-conf
+                        mountPath: /app/data/config.json
+                        subPath: config.json
+                        readOnly: true
+                      # Local datasheets so boot never needs the network (see 10-configmap.yaml).
+                      - name: bifrost-conf
+                        mountPath: /app/data/pricing.json
+                        subPath: pricing.json
+                        readOnly: true
+                      - name: bifrost-conf
+                        mountPath: /app/data/model-parameters.json
+                        subPath: model-parameters.json
+                        readOnly: true
+                      - name: vertex-credentials
+                        mountPath: /etc/gcp
+                        readOnly: true
+                      - name: tmp
+                        mountPath: /tmp
+                  # Secret vertex-credentials (key credentials.json) is created by the
+                  # k3s-manifests activation unit; until it exists the pod reports
+                  # CreateContainerConfigError and starts when the secret appears.
+                  # Until the host ADC is renewed it starts but every Vertex call fails
+                  # with a legible token-refresh error (see 00-README.md).
+            volumes:
+                - name: bifrost-state
+                  persistentVolumeClaim:
+                      claimName: bifrost-state
+                # All keys projected as files named by key; the container mounts the
+                # three it needs via subPath (config.json, pricing.json,
+                # model-parameters.json). Keys absent from a restricted items list
+                # would be created as empty dirs by kubelet - hence no items filter.
+                - name: bifrost-conf
+                  configMap:
+                      name: bifrost-config
+                - name: vertex-credentials
+                  secret:
+                      secretName: vertex-credentials
+                      items:
+                          - key: credentials.json
+                            path: credentials.json
+                - name: tmp
+                  emptyDir:
+                      sizeLimit: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+    name: bifrost
+    namespace: bifrost
+    labels:
+        app.kubernetes.io/name: bifrost
+        app.kubernetes.io/component: model-gateway
+        app.kubernetes.io/part-of: aiidalab-openclaw-demo
+spec:
+    type: ClusterIP
+    selector:
+        app.kubernetes.io/name: bifrost
+    ports:
+        - name: http
+          port: 8080
+          targetPort: http
+          protocol: TCP

@@ -1,0 +1,422 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+    name: default-deny
+    namespace: edge
+spec:
+    podSelector: {}
+    policyTypes:
+        - Ingress
+        - Egress
+    ingress: []
+    egress: []
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+    name: default-deny
+    namespace: openclaw
+spec:
+    podSelector: {}
+    policyTypes:
+        - Ingress
+        - Egress
+    ingress: []
+    egress: []
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+    name: default-deny
+    namespace: aiidalab
+spec:
+    podSelector: {}
+    policyTypes:
+        - Ingress
+        - Egress
+    ingress: []
+    egress: []
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+    name: default-deny
+    namespace: bifrost
+spec:
+    podSelector: {}
+    policyTypes:
+        - Ingress
+        - Egress
+    ingress: []
+    egress: []
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+    name: default-deny
+    namespace: slurm
+spec:
+    podSelector: {}
+    policyTypes:
+        - Ingress
+        - Egress
+    ingress: []
+    egress: []
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+    name: allow-edge-egress
+    namespace: edge
+spec:
+    podSelector: {}
+    policyTypes:
+        - Egress
+    egress:
+        # CoreDNS pods; also covered via the service VIP below.
+        - to:
+            - namespaceSelector:
+                matchLabels:
+                    kubernetes.io/metadata.name: kube-system
+              podSelector:
+                matchLabels:
+                    k8s-app: kube-dns
+          ports:
+            - {protocol: UDP, port: 53}
+            - {protocol: TCP, port: 53}
+        # cloudflared -> Cloudflare edge: argotunnel connects on 443 tcp and
+        # 7844 tcp+udp; Access JWKS fetches ride 443. FQDN allowlists are not
+        # expressible in native NetworkPolicy, so the matrix's
+        # *.argotunnel.com entries carry as these ports against public IPs.
+        - to:
+            - ipBlock:
+                cidr: 0.0.0.0/0
+                except:
+                    - 10.0.0.0/8
+                    - 172.16.0.0/12
+                    - 192.168.0.0/16
+                    - 169.254.0.0/16
+                    - 127.0.0.0/8
+          ports:
+            - {protocol: TCP, port: 443}
+            - {protocol: TCP, port: 7844}
+            - {protocol: UDP, port: 7844}
+        # Tunnel origins: namespace selectors cover the post-DNAT pod path;
+        # the service-CIDR ipBlock covers the pre-DNAT VIP path.
+        - to:
+            - namespaceSelector:
+                matchLabels:
+                    kubernetes.io/metadata.name: openclaw
+            - ipBlock:
+                cidr: 10.43.0.0/16
+          ports:
+            - {protocol: TCP, port: 18789}
+            # Portal wildcard route: 18790 is the Service port cloudflared
+            # dials, 18791 the pod port the relay listens on after DNAT.
+            - {protocol: TCP, port: 18790}
+            - {protocol: TCP, port: 18791}
+        - to:
+            - namespaceSelector:
+                matchLabels:
+                    kubernetes.io/metadata.name: aiidalab
+          ports:
+            - {protocol: TCP, port: 8888}
+        # DNS via the CoreDNS service VIP (k3s default 10.43.0.10).
+        - to:
+            - ipBlock:
+                cidr: 10.43.0.0/16
+          ports:
+            - {protocol: UDP, port: 53}
+            - {protocol: TCP, port: 53}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+    name: allow-openclaw-ingress
+    namespace: openclaw
+spec:
+    podSelector: {}
+    policyTypes:
+        - Ingress
+    ingress:
+        - from:
+            - namespaceSelector:
+                matchLabels:
+                    kubernetes.io/metadata.name: edge
+          ports:
+            - {protocol: TCP, port: 18789}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+    name: allow-openclaw-egress
+    namespace: openclaw
+spec:
+    podSelector: {}
+    policyTypes:
+        - Egress
+    egress:
+        # CoreDNS pods; also covered via the service VIP below.
+        - to:
+            - namespaceSelector:
+                matchLabels:
+                    kubernetes.io/metadata.name: kube-system
+              podSelector:
+                matchLabels:
+                    k8s-app: kube-dns
+          ports:
+            - {protocol: UDP, port: 53}
+            - {protocol: TCP, port: 53}
+        # DNS via the CoreDNS service VIP (k3s default 10.43.0.10).
+        - to:
+            - ipBlock:
+                cidr: 10.43.0.0/16
+          ports:
+            - {protocol: UDP, port: 53}
+            - {protocol: TCP, port: 53}
+        # aiida-mcp (aiidalab ns).
+        - to:
+            - namespaceSelector:
+                matchLabels:
+                    kubernetes.io/metadata.name: aiidalab
+            - ipBlock:
+                cidr: 10.43.0.0/16
+          ports:
+            - {protocol: TCP, port: 8080}
+        # bifrost (bifrost ns).
+        - to:
+            - namespaceSelector:
+                matchLabels:
+                    kubernetes.io/metadata.name: bifrost
+          ports:
+            - {protocol: TCP, port: 8080}
+        # Internet minus RFC1918, no port restriction (matrix).
+        - to:
+            - ipBlock:
+                cidr: 0.0.0.0/0
+                except:
+                    - 10.0.0.0/8
+                    - 172.16.0.0/12
+                    - 192.168.0.0/16
+                    - 169.254.0.0/16
+                    - 127.0.0.0/8
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+    name: allow-aiidalab-ingress
+    namespace: aiidalab
+spec:
+    podSelector: {}
+    policyTypes:
+        - Ingress
+    ingress:
+        # aiidalab:8888, consumed by edge.
+        - from:
+            - namespaceSelector:
+                matchLabels:
+                    kubernetes.io/metadata.name: edge
+          ports:
+            - {protocol: TCP, port: 8888}
+        # aiida-mcp:8080, consumed by openclaw.
+        - from:
+            - namespaceSelector:
+                matchLabels:
+                    kubernetes.io/metadata.name: openclaw
+          ports:
+            - {protocol: TCP, port: 8080}
+        # Same-namespace stack: postgres, rabbitmq, and the jupyter/mcp pair.
+        - from:
+            - podSelector: {}
+          ports:
+            - {protocol: TCP, port: 5432}
+            - {protocol: TCP, port: 5672}
+            - {protocol: TCP, port: 8888}
+            - {protocol: TCP, port: 8080}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+    name: allow-aiidalab-egress
+    namespace: aiidalab
+spec:
+    podSelector: {}
+    policyTypes:
+        - Egress
+    egress:
+        # CoreDNS pods; also covered via the service VIP below.
+        - to:
+            - namespaceSelector:
+                matchLabels:
+                    kubernetes.io/metadata.name: kube-system
+              podSelector:
+                matchLabels:
+                    k8s-app: kube-dns
+          ports:
+            - {protocol: UDP, port: 53}
+            - {protocol: TCP, port: 53}
+        # DNS via the CoreDNS service VIP (k3s default 10.43.0.10).
+        - to:
+            - ipBlock:
+                cidr: 10.43.0.0/16
+          ports:
+            - {protocol: UDP, port: 53}
+            - {protocol: TCP, port: 53}
+        # Same-namespace stack: postgres, rabbitmq, and the jupyter/mcp pair.
+        - to:
+            - podSelector: {}
+          ports:
+            - {protocol: TCP, port: 5432}
+            - {protocol: TCP, port: 5672}
+            - {protocol: TCP, port: 8888}
+            - {protocol: TCP, port: 8080}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+    name: allow-bifrost-ingress
+    namespace: bifrost
+spec:
+    podSelector: {}
+    policyTypes:
+        - Ingress
+    ingress:
+        # bifrost:8080, consumed by openclaw.
+        - from:
+            - namespaceSelector:
+                matchLabels:
+                    kubernetes.io/metadata.name: openclaw
+          ports:
+            - {protocol: TCP, port: 8080}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+    name: allow-bifrost-egress
+    namespace: bifrost
+spec:
+    podSelector: {}
+    policyTypes:
+        - Egress
+    egress:
+        # CoreDNS pods; also covered via the service VIP below.
+        - to:
+            - namespaceSelector:
+                matchLabels:
+                    kubernetes.io/metadata.name: kube-system
+              podSelector:
+                matchLabels:
+                    k8s-app: kube-dns
+          ports:
+            - {protocol: UDP, port: 53}
+            - {protocol: TCP, port: 53}
+        # DNS via the CoreDNS service VIP (k3s default 10.43.0.10).
+        - to:
+            - ipBlock:
+                cidr: 10.43.0.0/16
+          ports:
+            - {protocol: UDP, port: 53}
+            - {protocol: TCP, port: 53}
+        # 443/tcp to the public internet (matrix).
+        - to:
+            - ipBlock:
+                cidr: 0.0.0.0/0
+                except:
+                    - 10.0.0.0/8
+                    - 172.16.0.0/12
+                    - 192.168.0.0/16
+                    - 169.254.0.0/16
+                    - 127.0.0.0/8
+          ports:
+            - {protocol: TCP, port: 443}
+---
+# Intra-namespace smoke-test path requested by bifrost: the vertex-smoke Job
+# reaches the in-namespace gateway on 8080. Addendum to the network matrix.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+    name: bifrost-smoke-path
+    namespace: bifrost
+spec:
+    podSelector:
+        matchLabels:
+            app.kubernetes.io/name: bifrost
+            app.kubernetes.io/component: gateway
+    policyTypes:
+        - Ingress
+    ingress:
+        - from:
+            - podSelector:
+                matchLabels:
+                    app.kubernetes.io/name: bifrost-vertex-smoke
+          ports:
+            - {protocol: TCP, port: 8080}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+    name: bifrost-smoke-egress
+    namespace: bifrost
+spec:
+    podSelector:
+        matchLabels:
+            app.kubernetes.io/name: bifrost-vertex-smoke
+    policyTypes:
+        - Egress
+    egress:
+        - to:
+            - podSelector:
+                matchLabels:
+                    app.kubernetes.io/name: bifrost
+                    app.kubernetes.io/component: gateway
+          ports:
+            - {protocol: TCP, port: 8080}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+    name: allow-slurm-ingress
+    namespace: slurm
+spec:
+    podSelector: {}
+    policyTypes:
+        - Ingress
+    ingress:
+        # sshd listens on 2222 in the pod; the Service maps 22 -> 2222 and
+        # kube-router evaluates policy after DNAT, so the pod port is what counts.
+        - from:
+            - namespaceSelector:
+                matchLabels:
+                    kubernetes.io/metadata.name: aiidalab
+          ports:
+            - {protocol: TCP, port: 2222}
+            - {protocol: TCP, port: 6817}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+    name: allow-slurm-egress
+    namespace: slurm
+spec:
+    podSelector: {}
+    policyTypes:
+        - Egress
+    egress:
+        # CoreDNS pods; also covered via the service VIP below.
+        - to:
+            - namespaceSelector:
+                matchLabels:
+                    kubernetes.io/metadata.name: kube-system
+              podSelector:
+                matchLabels:
+                    k8s-app: kube-dns
+          ports:
+            - {protocol: UDP, port: 53}
+            - {protocol: TCP, port: 53}
+        # DNS via the CoreDNS service VIP (k3s default 10.43.0.10).
+        - to:
+            - ipBlock:
+                cidr: 10.43.0.0/16
+          ports:
+            - {protocol: UDP, port: 53}
+            - {protocol: TCP, port: 53}

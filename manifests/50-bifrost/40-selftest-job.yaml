@@ -1,0 +1,98 @@
+# Optional one-shot check: POST /v1/chat/completions to the gateway and print
+# model + usage. Created suspended; run manually:
+#     kubectl -n bifrost patch job bifrost-selftest --type=merge -p '{"spec":{"suspend":false}}'
+#     kubectl -n bifrost logs job/bifrost-selftest -f
+# Re-run: kubectl -n bifrost delete job bifrost-selftest, then patch again.
+# Expect HTTP 200 with model claude-sonnet-4-6 (region @VERTEX_REGION_CLAUDE@). While the
+# host ADC is expired, the fallback attempt uses claude-haiku-4-5; token-refresh
+# errors are the documented ADC blocker, not a routing problem.
+apiVersion: batch/v1
+kind: Job
+metadata:
+    name: bifrost-selftest
+    namespace: bifrost
+    labels:
+        app.kubernetes.io/name: bifrost-selftest
+        app.kubernetes.io/part-of: aiidalab-openclaw-demo
+spec:
+    suspend: true
+    backoffLimit: 0
+    template:
+        metadata:
+            labels:
+                app.kubernetes.io/name: bifrost-selftest
+                app.kubernetes.io/part-of: aiidalab-openclaw-demo
+        spec:
+            restartPolicy: Never
+            automountServiceAccountToken: false
+            securityContext:
+                # curlimages/curl declares a NAMED user (curl_user); kubelet cannot
+                # verify runAsNonRoot from a non-numeric image user, so pin the uid.
+                # curl_user is uid 100 in the image.
+                runAsNonRoot: true
+                runAsUser: 100
+                runAsGroup: 101
+                seccompProfile:
+                    type: RuntimeDefault
+            containers:
+                - name: selftest
+                  image: docker.io/curlimages/curl@sha256:3b8fde20978e330b401837f24b871ebe2c8d14ff7f07b87990bcd832588a1a75
+                  imagePullPolicy: IfNotPresent
+                  securityContext:
+                      allowPrivilegeEscalation: false
+                      capabilities:
+                          drop: [ALL]
+                      readOnlyRootFilesystem: true
+                  env:
+                      - name: SELFTEST_MODEL
+                        valueFrom:
+                            configMapKeyRef:
+                                name: bifrost-config
+                                key: model-id
+                      - name: SELFTEST_FALLBACK
+                        valueFrom:
+                            configMapKeyRef:
+                                name: bifrost-config
+                                key: fallback-model-id
+                  resources:
+                      requests:
+                          cpu: 20m
+                          memory: 32Mi
+                      limits:
+                          cpu: 200m
+                          memory: 128Mi
+                  volumeMounts:
+                      - name: tmp
+                        mountPath: /tmp
+                  command:
+                      - sh
+                      - -eu
+                      - |
+                          B=http://bifrost.bifrost.svc.cluster.local:8080
+                          run() {
+                              printf '{"model":"vertex/%s","messages":[{"role":"user","content":"Reply with exactly: sandbox ok"}],"max_tokens":64}' "$1" > /tmp/req.json
+                              code=$(curl -sS -m 120 -o /tmp/resp.json -w '%{http_code}' \
+                                  -H 'Content-Type: application/json' --data-binary @/tmp/req.json \
+                                  "$B/v1/chat/completions") || { echo "curl transport error"; exit 1; }
+                              echo "attempt model=vertex/$1 http_status=$code"
+                              cat /tmp/resp.json
+                              echo
+                              if [ "$code" = "200" ]; then
+                                  return 0
+                              fi
+                              return 1
+                          }
+                          if run "$SELFTEST_MODEL"; then
+                              exit 0
+                          fi
+                          if [ -n "${SELFTEST_FALLBACK:-}" ]; then
+                              echo "--- primary failed; trying fallback ---"
+                              if run "$SELFTEST_FALLBACK"; then
+                                  exit 0
+                              fi
+                          fi
+                          exit 1
+            volumes:
+                - name: tmp
+                  emptyDir:
+                      sizeLimit: 16Mi

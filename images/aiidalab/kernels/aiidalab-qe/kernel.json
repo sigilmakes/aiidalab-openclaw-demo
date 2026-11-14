@@ -1,0 +1,11 @@
+{
+  "argv": [
+    "/opt/venvs/qe/bin/python",
+    "-m",
+    "ipykernel_launcher",
+    "-f",
+    "{connection_file}"
+  ],
+  "display_name": "Python 3.12 (AiiDAlab-QE, aiida-core 2.9.4 + aiida-quantumespresso 4.12.1)",
+  "language": "python"
+}

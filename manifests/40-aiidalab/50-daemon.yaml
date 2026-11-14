@@ -1,0 +1,107 @@
+# AiiDA daemon: submits and drives calcjobs over SSH to the in-cluster SLURM
+# (service `slurm` in namespace `slurm`, port 22).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aiida-daemon
+  namespace: aiidalab
+  labels:
+    app: aiida-daemon
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: aiida-daemon
+  template:
+    metadata:
+      labels:
+        app: aiida-daemon
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 0
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: daemon
+          image: sandbox.local/aiidalab:26.10.0
+          imagePullPolicy: IfNotPresent
+          # The image script asks for two workers, and verdi refuses more than
+          # one in the foreground; the daemon runs here instead of in circus.
+          command:
+            - /usr/local/bin/aiidalab-entry.sh
+            - /opt/venvs/lab/bin/verdi
+            - daemon
+            - start
+            - --foreground
+            - "1"
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            readOnlyRootFilesystem: true
+          env:
+            - name: HOME
+              value: /home/aiida
+            - name: AIIDA_DB_HOST
+              value: aiidalab-postgres
+            - name: AIIDA_DB_PORT
+              value: "5432"
+            - name: AIIDA_RABBITMQ_HOST
+              value: aiidalab-rabbitmq
+            - name: AIIDA_RABBITMQ_PORT
+              value: "5672"
+            # sitecustomize.py from this path flips aiida-core's
+            # import_sys_environment default, which rootless slurmd cannot honour.
+            - name: PYTHONPATH
+              value: /opt/aiida-override
+          resources:
+            requests:
+              cpu: 500m
+              memory: 2Gi
+            limits:
+              cpu: "8"
+              memory: 16Gi
+          volumeMounts:
+            # filer's exporter; lives inside the home PVC so it survives restarts.
+            - name: aiida-tools
+              mountPath: /home/aiida/aiida-tools
+              readOnly: true
+            - name: home
+              mountPath: /home/aiida
+            # The SLURM ssh key is mounted here and nowhere else. Deliberately not
+            # /run/secrets: aiidalab-entry.sh copies /run/secrets/id_ed25519 into
+            # $HOME on the shared aiidalab-home PVC, which would put a
+            # Slurm-controller credential in reach of the Jupyter and MCP pods.
+            - name: slurm-key
+              mountPath: /etc/slurm-key
+              readOnly: true
+            - name: slurm-override
+              mountPath: /opt/aiida-override
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: aiida-tools
+          configMap:
+            name: aiida-tools
+        - name: home
+          persistentVolumeClaim:
+            claimName: aiidalab-home
+        - name: slurm-key
+          secret:
+            secretName: aiidalab-slurm
+            items:
+              - key: id_ed25519
+                path: id_ed25519
+            defaultMode: 0440
+        - name: slurm-override
+          configMap:
+            name: aiida-slurm-override
+        - name: tmp
+          emptyDir: {}

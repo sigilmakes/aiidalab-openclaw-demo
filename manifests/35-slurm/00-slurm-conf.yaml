@@ -1,0 +1,140 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: slurm-conf
+  namespace: slurm
+  labels:
+    app.kubernetes.io/name: slurm
+    app.kubernetes.io/part-of: aiidalab-openclaw-demo
+data:
+  slurm.conf: |
+    # Sandbox mini-cluster: one controller pod (slurmctld-0) and one compute
+    # pod (slurmd Deployment with the hostname fixed to compute01). Both run on the
+    # single node, so the RWO local-path claim is mountable by
+    # both. Everything runs as uid 1000 (aiida) because the namespace enforces
+    # the restricted PSS; rootless slurmd is supported since Slurm 24.05 and
+    # requires SlurmdUser to match the slurmd process uid.
+    ClusterName=sandbox
+    # The name must match the pod's own hostname, and the address in brackets
+    # is how the compute node finds it without DNS for the pod name.
+    SlurmctldHost=slurmctld-0(slurmctld-0.slurmctld.slurm.svc.cluster.local)
+    MailProg=/bin/true
+    # The pod sees the host's cores; the configured node size wins.
+    SlurmdParameters=config_overrides
+    AuthInfo=/var/munge-rt/munge/munge.socket.2
+    AuthType=auth/munge
+    CryptoType=crypto/munge
+    # proctrack/pgid cannot reap a step under a rootless slurmd in a container:
+    # after 'scancel' the batch script dies but slurmstepd keeps waiting, the
+    # step socket is gone before slurmctld's kill arrives, and the node ends up
+    # DRAINing with "Kill task failed (JobId=N StepId=batch)" while the job sits
+    # in COMPLETING for ~130 s (measured: jobs 15, 35, 36). proctrack/linuxproc
+    # walks /proc and completes the same cancels in under a second (measured:
+    # jobs 39-42), with no leftover slurmstepd and no DRAIN.
+    ProctrackType=proctrack/linuxproc
+    TaskPlugin=task/none
+    SwitchType=switch/none
+    SchedulerType=sched/backfill
+    SelectType=select/cons_tres
+    SelectTypeParameters=CR_Core_Memory
+    # The local-path volume arrives world-writable, which slurmctld refuses;
+    # the state lives one level down in a directory it owns.
+    StateSaveLocation=/var/spool/slurmctld/state
+    SlurmdSpoolDir=/var/spool/slurmd/run
+    SlurmUser=aiida
+    # slurmd runs as uid 1000, not root. Slurm hard-refuses '#SBATCH --get-user-env'
+    # in that case ("SlurmdUser must be root to use --get-user-env"), the launch
+    # fails, the requeue is refused because the script says --no-requeue, and
+    # slurmctld cancels the job before it ever runs. AiiDA emits that directive
+    # whenever metadata.options.import_sys_environment is true, which is its
+    # default, so every AiiDA submission must set it false; the MCP server does
+    # that for its callers and refuses a spec that sets it true.
+    SlurmdUser=aiida
+    SlurmctldPidFile=/var/spool/slurmctld/slurmctld.pid
+    SlurmdPidFile=/var/spool/slurmd/slurmd.pid
+    SlurmctldLogFile=/dev/null
+    SlurmdLogFile=/dev/null
+    SlurmctldTimeout=120
+    SlurmdTimeout=120
+    InactiveLimit=0
+    KillWait=30
+    MinJobAge=300
+    ReturnToService=2
+    NodeName=compute01 NodeAddr=slurmd CPUs=8 RealMemory=15000 State=UNKNOWN
+    PartitionName=debug Default=YES Nodes=compute01 MaxTime=INFINITE State=UP
+    PartitionName=batch Nodes=compute01 MaxTime=INFINITE State=UP
+  cgroup.conf: |
+    # Rootless slurmd would otherwise create a systemd scope for slurmstepd,
+    # which fails without root privileges and aborts the daemon.
+    CgroupPlugin=disabled
+  sshd_config: |
+    # AiiDA transport listener. sshd runs as uid 1000 (aiida), so there is no
+    # setuid anywhere in the pod and no privileged port: the Service maps 22
+    # to this in-pod port and netpol governs who may connect.
+    Port 2222
+    ListenAddress 0.0.0.0
+    HostKey /var/spool/slurmctld/ssh/ssh_host_ed25519_key
+    HostKey /var/spool/slurmctld/ssh/ssh_host_rsa_key
+    PermitRootLogin no
+    PasswordAuthentication no
+    PubkeyAuthentication yes
+    # The key comes from a mounted Secret, so the containing directory is
+    # group-writable with the sticky bit and sshd refuses it otherwise. The
+    # file is root-owned and read-only; there is no user-writable path here.
+    StrictModes no
+    UsePAM no
+    AuthorizedKeysFile /etc/auth/authorized_keys
+    PidFile /var/munge-rt/sshd.pid
+    PermitUserEnvironment no
+    X11Forwarding no
+    AllowTcpForwarding no
+    AllowAgentForwarding no
+    Subsystem sftp internal-sftp
+    SetEnv PATH=/bin
+  selftest.sh: |
+    #!/bin/bash
+    set -euo pipefail
+    MSOCK=/var/munge-rt/munge/munge.socket.2
+    echo "== slurm-selftest: waiting for compute01 to register"
+    registered=""
+    for i in $(seq 1 60); do
+        if sinfo -h -N 2>/dev/null | grep -q '^compute01'; then
+            registered=yes
+            break
+        fi
+        sleep 2
+    done
+    if [ -z "$registered" ]; then
+        echo "FAIL: compute01 did not register within 120 seconds"
+        sinfo || true
+        scontrol ping || true
+        exit 1
+    fi
+    echo "== sinfo"
+    sinfo
+    echo "== munge round-trip"
+    munge -S "$MSOCK" -n | unmunge -S "$MSOCK"
+    echo "== submit probe job"
+    jid=$(sbatch --parsable --chdir /scratch/aiida --job-name=selftest-probe \
+        --wrap 'hostname && nproc && test -x /opt/qe/bin/pw.x && echo QE_PW_X_OK')
+    echo "submitted job $jid"
+    state=""
+    for i in $(seq 1 60); do
+        state=$(scontrol show job "$jid" | grep -oE 'JobState=[A-Z_]+' | cut -d= -f2 | head -1)
+        echo "  $jid state=$state"
+        case "$state" in
+            COMPLETED) break ;;
+            COMPLETING|RUNNING|PENDING|CONFIGURING) sleep 2 ;;
+            *) echo "FAIL: unexpected state $state"; scontrol show job "$jid"; exit 1 ;;
+        esac
+    done
+    if [ "$state" != "COMPLETED" ]; then
+        echo "FAIL: job $jid ended in $state"
+        scontrol show job "$jid"
+        exit 1
+    fi
+    out=$(scontrol show job "$jid" | grep -oE 'StdOut=[^ ]+' | cut -d= -f2)
+    echo "== job stdout ($out)"
+    cat "$out" 2>/dev/null || true
+    scontrol show job "$jid" | grep -E 'JobState=|ExitCode='
+    echo "SELFTEST OK"

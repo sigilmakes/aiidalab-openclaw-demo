@@ -1,0 +1,97 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: openclaw-ingress
+  namespace: openclaw
+  labels:
+    app.kubernetes.io/name: openclaw
+    app.kubernetes.io/part-of: aiidalab-openclaw-demo
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: openclaw
+  policyTypes:
+  - Ingress
+  ingress:
+  # Only the edge proxy reaches the gateway, on the control port and on the
+  # portal relay (18791 on the pod; the Service fronts it as 18790).
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: edge
+    ports:
+    - protocol: TCP
+      port: 18789
+    - protocol: TCP
+      port: 18791
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: openclaw-egress
+  namespace: openclaw
+  labels:
+    app.kubernetes.io/name: openclaw
+    app.kubernetes.io/part-of: aiidalab-openclaw-demo
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: openclaw
+  policyTypes:
+  - Egress
+  egress:
+  # Cluster DNS, only out of kube-system
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+  # Bifrost OpenAI-compatible model gateway
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: bifrost
+    ports:
+    - protocol: TCP
+      port: 8080
+  # aiida-mcp streamable HTTP server
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: aiidalab
+    ports:
+    - protocol: TCP
+      port: 8080
+  # Kubernetes API, for read-only kubectl exec into the two ops pods. The
+  # default k3s Service address is 10.43.0.1.
+  - to:
+    - ipBlock:
+        cidr: 10.43.0.1/32
+    ports:
+    - protocol: TCP
+      port: 443
+  # The 10.43.0.1 Service DNATs to the node address; kube-router evaluates
+  # egress after DNAT, so allow the node's API port as well.
+  - to:
+    - ipBlock:
+        cidr: @NODE_ADDRESS@/32
+    ports:
+    - protocol: TCP
+      port: 6443
+  # Internet; everything except private and link-local space is denied
+  - to:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+        except:
+        - 10.0.0.0/8
+        - 172.16.0.0/12
+        - 192.168.0.0/16
+        - 169.254.0.0/16
+        - 127.0.0.0/8

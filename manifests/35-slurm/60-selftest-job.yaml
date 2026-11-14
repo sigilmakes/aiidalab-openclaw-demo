@@ -1,0 +1,122 @@
+# Runs once per deploy wave that changes the manifest tree (kubectl apply
+# recreates it after the TTL deletes it). It proves the full path the AiiDA
+# worker depends on: controller reachable, munge round-trip, node registered,
+# batch job dispatched to compute01 and COMPLETED, pw.x present. To re-run by
+# hand: kubectl -n slurm delete job slurm-selftest && kubectl apply -f <this
+# file's deploy path>.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: slurm-selftest
+  namespace: slurm
+  labels:
+    app.kubernetes.io/name: slurm
+    app.kubernetes.io/component: selftest
+    app.kubernetes.io/part-of: aiidalab-openclaw-demo
+spec:
+  ttlSecondsAfterFinished: 3600
+  backoffLimit: 2
+  activeDeadlineSeconds: 600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: slurm
+        app.kubernetes.io/component: selftest
+    spec:
+      automountServiceAccountToken: false
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+        # Without fsGroup the Secret arrives as root:root 0400 and the init
+        # container, which runs as uid 998, cannot read it ("install: cannot
+        # open '/munge-src/munge.key': Permission denied"). The kubelet only
+        # adds the group read bit for a volume when the pod names a fsGroup,
+        # which is what the controller and compute pods already do.
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      initContainers:
+      - name: munge-key-setup
+        image: sandbox.local/slurm:26.05.5
+        imagePullPolicy: IfNotPresent
+        command: ["bash", "-c", "install -Dm0400 /munge-src/munge.key /var/munge-rt/munge/munge.key"]
+        securityContext:
+          runAsUser: 998
+          runAsGroup: 1000
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: [ALL]
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - name: munge-key
+          mountPath: /munge-src
+          readOnly: true
+        - name: munge-rt
+          mountPath: /var/munge-rt
+      # A native sidecar, not a plain container: `munged -F` runs for the
+      # pod's lifetime, and as an ordinary container it would keep the Job
+      # from ever reaching Complete, so the TTL would never expire and the pod
+      # would sit at 1/2. A restartPolicy: Always init container is started
+      # before `main` and terminated once `main` exits.
+      - name: munged
+        restartPolicy: Always
+        image: sandbox.local/slurm:26.05.5
+        imagePullPolicy: IfNotPresent
+        # --force for the same reason as in the controller pod: the pod
+        # emptyDir is group-writable by kubelet design.
+        command: ["munged", "-F", "--force",
+          "--socket=/var/munge-rt/munge/munge.socket.2",
+          "--key-file=/var/munge-rt/munge/munge.key",
+          "--pid-file=/var/munge-rt/munged.pid",
+          "--seed-file=/var/munge-rt/munged.seed",
+          "--log-file=/var/munge-rt/munged.log",
+          "--num-threads=10"]
+        securityContext:
+          runAsUser: 998
+          runAsGroup: 1000
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: [ALL]
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - name: munge-rt
+          mountPath: /var/munge-rt
+      containers:
+      - name: main
+        image: sandbox.local/slurm:26.05.5
+        imagePullPolicy: IfNotPresent
+        # Same identity as an ssh session: uid 1000 (aiida).
+        command: ["bash", "/etc/slurm/selftest.sh"]
+        securityContext:
+          runAsUser: 1000
+          runAsGroup: 1000
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: [ALL]
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - name: slurm-conf
+          mountPath: /etc/slurm
+          readOnly: true
+        - name: munge-rt
+          mountPath: /var/munge-rt
+        - name: scratch
+          mountPath: /scratch
+        - name: tmp
+          mountPath: /tmp
+      volumes:
+      - name: munge-key
+        secret:
+          secretName: munge-key
+          defaultMode: 0400
+      - name: slurm-conf
+        configMap:
+          name: slurm-conf
+      - name: munge-rt
+        emptyDir: {}
+      - name: scratch
+        persistentVolumeClaim:
+          claimName: slurm-scratch
+      - name: tmp
+        emptyDir: {}

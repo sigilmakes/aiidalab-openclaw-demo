@@ -1,0 +1,131 @@
+# Network matrix for the aiidalab namespace.
+# Base: `default-deny` (ingress+egress) lives in manifests/10-network-policy.yaml;
+# this file only adds allow rules on top of it.
+# Egress contract (pivot 2026-10-29): DNS, same-namespace service ports, the
+# in-cluster slurm namespace on 22/tcp. No public internet egress.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: aiidalab-egress-dns
+  namespace: aiidalab
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: aiidalab-egress-same-ns
+  namespace: aiidalab
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+      - podSelector: {}
+      ports:
+        - port: 5432
+          protocol: TCP
+        - port: 5672
+          protocol: TCP
+        - port: 8888
+          protocol: TCP
+        - port: 8080
+          protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: aiidalab-egress-slurm-22
+  namespace: aiidalab
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: slurm
+      ports:
+        # 22 is the Service port; 2222 is what the pod actually listens on after
+        # DNAT, and 6817 is the controller RPC used by squeue/verdi status.
+        - port: 22
+          protocol: TCP
+        - port: 2222
+          protocol: TCP
+        - port: 6817
+          protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: aiidalab-ingress-same-ns
+  namespace: aiidalab
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+      - podSelector: {}
+      ports:
+        - port: 5432
+          protocol: TCP
+        - port: 5672
+          protocol: TCP
+        - port: 8888
+          protocol: TCP
+        - port: 8080
+          protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: aiidalab-ingress-jupyter-8888
+  namespace: aiidalab
+spec:
+  podSelector:
+    matchLabels:
+      app: aiidalab-jupyter
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: edge
+      ports:
+        - port: 8888
+          protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: aiidalab-ingress-mcp-8080
+  namespace: aiidalab
+spec:
+  podSelector:
+    matchLabels:
+      app: aiida-mcp
+  policyTypes: [Ingress]
+  ingress:
+    # Only the in-cluster agent namespace. edge (cloudflared) is internet-facing,
+    # so it must not reach a tool port that submits AiiDA work.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: openclaw
+      ports:
+        - port: 8080
+          protocol: TCP

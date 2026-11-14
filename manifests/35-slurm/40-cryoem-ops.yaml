@@ -1,0 +1,91 @@
+# CPU-only Pipeliner submit host. The image is built from images/cryoem/Dockerfile
+# by k3s-cryoem-image; it contains RELION, CTFFIND, Pipeliner, and a matching
+# Slurm client. Runs foreground jobs on the shared cryoem-scratch claim.
+apiVersion: v1
+kind: Service
+metadata:
+  name: cryoem-ops
+  namespace: slurm
+  labels:
+    app.kubernetes.io/name: cryoem-ops
+    app.kubernetes.io/part-of: aiidalab-openclaw-demo
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: cryoem-ops
+  ports:
+  - name: noop
+    port: 1
+    targetPort: 1
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: cryoem-ops
+  namespace: slurm
+  labels:
+    app.kubernetes.io/name: cryoem-ops
+    app.kubernetes.io/part-of: aiidalab-openclaw-demo
+spec:
+  replicas: 1
+  serviceName: cryoem-ops
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cryoem-ops
+  template:
+    metadata:
+      annotations:
+        demo.local/cryoem-image: "@CRYOEM_IMAGE_CHECKSUM@"
+      labels:
+        app.kubernetes.io/name: cryoem-ops
+        app.kubernetes.io/part-of: aiidalab-openclaw-demo
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+      - name: cryoem
+        image: sandbox.local/cryoem:1.6.1
+        imagePullPolicy: IfNotPresent
+        command: ["/bin/bash", "-lc"]
+        args:
+        - |
+          set -euo pipefail
+          mkdir -p /scratch/cryoem/home /scratch/cryoem/scratch /scratch/cryoem/projects /scratch/cryoem/uploads
+          exec sleep infinity
+        env:
+        - name: HOME
+          value: /scratch/cryoem/home
+        - name: XDG_CONFIG_HOME
+          value: /scratch/cryoem/home/.config
+        - name: PIPELINER_CTFFIND_EXECUTABLE
+          value: /opt/ctffind/bin/ctffind
+        - name: RELION_SCRATCH_DIR
+          value: /scratch/cryoem/scratch
+        securityContext:
+          runAsUser: 1000
+          runAsGroup: 1000
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: [ALL]
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - name: scratch
+          mountPath: /scratch/cryoem
+        - name: tmp
+          mountPath: /tmp
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+      volumes:
+      - name: scratch
+        persistentVolumeClaim:
+          claimName: cryoem-scratch
+      - name: tmp
+        emptyDir: {}

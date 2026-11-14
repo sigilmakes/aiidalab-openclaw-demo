@@ -1,0 +1,78 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: openclaw-ops
+  namespace: openclaw
+  labels:
+    app.kubernetes.io/name: openclaw
+    app.kubernetes.io/part-of: aiidalab-openclaw-demo
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: openclaw-ops-aiidalab
+  namespace: aiidalab
+  labels:
+    app.kubernetes.io/name: openclaw
+    app.kubernetes.io/part-of: aiidalab-openclaw-demo
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    resourceNames: ["aiida-ops-0"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    resourceNames: ["aiida-ops-0"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: openclaw-ops-aiidalab
+  namespace: aiidalab
+  labels:
+    app.kubernetes.io/name: openclaw
+    app.kubernetes.io/part-of: aiidalab-openclaw-demo
+subjects:
+  - kind: ServiceAccount
+    name: openclaw-ops
+    namespace: openclaw
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: openclaw-ops-aiidalab
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: openclaw-ops-slurm
+  namespace: slurm
+  labels:
+    app.kubernetes.io/name: openclaw
+    app.kubernetes.io/part-of: aiidalab-openclaw-demo
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    resourceNames: ["slurmctld-0", "cryoem-ops-0"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    resourceNames: ["slurmctld-0", "cryoem-ops-0"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: openclaw-ops-slurm
+  namespace: slurm
+  labels:
+    app.kubernetes.io/name: openclaw
+    app.kubernetes.io/part-of: aiidalab-openclaw-demo
+subjects:
+  - kind: ServiceAccount
+    name: openclaw-ops
+    namespace: openclaw
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: openclaw-ops-slurm

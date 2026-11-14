@@ -1,0 +1,118 @@
+# Sidecar scripts for the slurm namespace. Both are mounted at
+# /etc/slurm-scripts and run as plain uid 1000 (or 998 for munged) with no
+# added capabilities, which is what the restricted PSS allows here.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: slurm-scripts
+  namespace: slurm
+  labels:
+    app.kubernetes.io/name: slurm
+    app.kubernetes.io/part-of: aiidalab-openclaw-demo
+data:
+  munged-supervisor.sh: |
+    #!/bin/bash
+    # munged reads its key once at startup, keeps it in memory, and has no reload
+    # signal. A rotated munge-key Secret therefore stays invisible to a running
+    # munged, and restarting only one of the two pods is worse than restarting
+    # neither: controller and compute then hold different keys and every RPC
+    # fails with "Unauthorized credential".
+    #
+    # This wrapper installs the mounted key, starts munged, and restarts it when
+    # the mounted digest stops matching the key it loaded. Both pods watch the
+    # same Secret, so both rotate within one poll interval (default 10 s), far
+    # inside SlurmdTimeout=120, which leaves the compute node no time to go down.
+    # Flags after the script name are passed to munged unchanged.
+    set -u
+
+    MUNGE_KEY_SRC=${MUNGE_KEY_SRC:-/munge-src/munge.key}
+    MUNGE_KEY_DST=${MUNGE_KEY_DST:-/var/munge-rt/munge/munge.key}
+    MUNGE_KEY_POLL=${MUNGE_KEY_POLL:-10}
+
+    log() { printf '%s munged-supervisor: %s\n' "$(date -Is)" "$*"; }
+    digest() { sha256sum "$1" 2>/dev/null | cut -d' ' -f1; }
+    install_key() { install -Dm0400 "$MUNGE_KEY_SRC" "$MUNGE_KEY_DST"; }
+
+    MUNGED_PID=
+    start_munged() {
+        "$@" &
+        MUNGED_PID=$!
+        log "started munged (pid $MUNGED_PID)"
+    }
+    stop_munged() {
+        [ -n "$MUNGED_PID" ] || return 0
+        kill -TERM "$MUNGED_PID" 2>/dev/null || true
+        wait "$MUNGED_PID" 2>/dev/null || true
+        MUNGED_PID=
+    }
+
+    # kubelet sends TERM on pod shutdown: hand it to munged and leave.
+    trap 'stop_munged; exit 0' TERM INT
+
+    install_key || { log "cannot install key from $MUNGE_KEY_SRC"; exit 1; }
+    loaded=$(digest "$MUNGE_KEY_DST")
+    start_munged "$@"
+
+    while :; do
+        sleep "$MUNGE_KEY_POLL" &
+        wait $! || true
+        if ! kill -0 "$MUNGED_PID" 2>/dev/null; then
+            log "munged exited; restarting"
+            wait "$MUNGED_PID" 2>/dev/null || true
+            MUNGED_PID=
+            install_key && start_munged "$@"
+            continue
+        fi
+        want=$(digest "$MUNGE_KEY_SRC")
+        if [ -n "$want" ] && [ "$want" != "$loaded" ]; then
+            log "mounted key changed; restarting munged on the new key"
+            stop_munged
+            install_key || log "install of the new key failed, retrying"
+            loaded=$(digest "$MUNGE_KEY_DST")
+            start_munged "$@"
+        fi
+    done
+  node-reconciler.sh: |
+    #!/bin/bash
+    # slurmctld resolves NodeAddr to an address once and keeps it for the life of
+    # the process. When the compute pod is replaced, its new address is never
+    # adopted and the controller keeps pinging the dead one: the node goes
+    # NOT_RESPONDING, then DOWN, and every submission queues behind it. The node
+    # meanwhile registers fine, which makes the failure look like a slurmd fault
+    # when it is a stale controller cache.
+    #
+    # This sidecar compares the address the controller holds with this pod's own
+    # and points the controller at the live one, then resumes a node that is not
+    # usable. Only "not usable" states are touched: not responding (any state
+    # with a '*'), down, unknown, fail, future. A node an operator drained on
+    # purpose stays drained.
+    set -u
+
+    NODE=${NODE_NAME:-$(hostname)}
+    SOCK=${MUNGE_SOCKET:-/var/munge-rt/munge/munge.socket.2}
+    INTERVAL=${RECONCILE_INTERVAL:-20}
+
+    log() { printf '%s node-reconciler: %s\n' "$(date -Is)" "$*"; }
+    state_of() { sinfo -h -n "$NODE" -o '%T' 2>/dev/null | head -1; }
+    addr_of() { scontrol show node "$NODE" 2>/dev/null | sed -n 's/.*NodeAddr=\([^ ]*\).*/\1/p' | head -1; }
+
+    log "watching $NODE every ${INTERVAL}s"
+    while :; do
+        addr=$(hostname -i 2>/dev/null | awk '{print $1}')
+        if [ -n "$addr" ] && [ -S "$SOCK" ] && scontrol ping >/dev/null 2>&1; then
+            cur=$(addr_of)
+            if [ -n "$cur" ] && [ "$cur" != "$addr" ]; then
+                log "controller holds $NODE at $cur, this pod is $addr: updating"
+                scontrol update NodeName="$NODE" NodeAddr="$addr" >/dev/null 2>&1 || true
+                sleep 3
+            fi
+            state=$(state_of)
+            case "$state" in
+                down|unknown|fail|future|*"*"*)
+                    log "state=$state: resuming $NODE"
+                    scontrol update NodeName="$NODE" State=RESUME >/dev/null 2>&1 || true
+                    ;;
+            esac
+        fi
+        sleep "$INTERVAL"
+    done

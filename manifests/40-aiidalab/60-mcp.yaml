@@ -1,0 +1,1717 @@
+# MCP bridge: an authenticated front (bearer token) reverse-proxies to
+# mcp-proxy, which fronts the aiida-agents stdio MCP server. Contract:
+# ClusterIP `aiida-mcp` port 8080, called with
+# `Authorization: Bearer <secret aiida-mcp-client key token>`.
+#
+# Two layers guard the write tool: the token in front.py, and an allow-list in
+# server.py that refuses metadata.options keys AiiDA would copy verbatim into
+# the batch script that runs on the compute node.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: aiida-mcp-code
+  namespace: aiidalab
+  labels:
+    app: aiida-mcp
+data:
+  server.py: |
+    import ast, json, os, re, subprocess, sys, time
+
+    import httpx
+    from urllib.parse import quote
+    from aiida_agents.mcp.server import get_mcp
+
+    PLUGIN_DIR = os.environ.get('AIIDA_PLUGIN_DIR', '/plugins')
+
+    # Plugin packages copied out of the lab venv by an init container. Only these
+    # two directories, never the whole lab site-packages: that would make this venv
+    # resolve cachetools from lab and fastmcp would fail at import.
+    if os.path.isdir(PLUGIN_DIR) and PLUGIN_DIR not in sys.path:
+        sys.path.insert(0, PLUGIN_DIR)
+    from aiida_agents.mcp.tools import to_mcp_tool_error
+
+    # AiiDA writes these verbatim into the sbatch script that runs on the compute
+    # node, so accepting them from a caller would be remote shell execution as
+    # aiida on compute01. The write tool exists to submit a calculation spec.
+    FORBIDDEN = (
+        "append_text", "prepend_text", "custom_scheduler_commands",
+        "environment_variables", "scheduler_stdout", "scheduler_stderr",
+        "submit_script_filename", "mpirun_extra_params",
+    )
+    # aiida-quantumespresso copies settings.CMDLINE into the pw.x command line.
+    FORBIDDEN_SETTINGS = ("CMDLINE", "cmdline")
+
+    SUB = """import json, sys
+
+    from aiida import load_profile; load_profile()
+    from aiida.orm import load_node
+
+    # Matched on node_type rather than isinstance: this process imports aiida from
+    # the lab venv, while the agents venv next to it has its own copy of the same
+    # classes, so isinstance would compare two different class objects.
+    spec = json.loads(sys.stdin.read())
+    inputs = spec['inputs']
+
+    def _pk(ref):
+        return ref.get('pk') if isinstance(ref, dict) else ref
+
+
+    code = inputs.get('code')
+    if code is not None and _pk(code) is not None:
+        node_type = load_node(_pk(code)).node_type
+        if not node_type.startswith('data.core.code.installed'):
+            raise ValueError('code %r is a %s, not an InstalledCode' % (code, node_type))
+    for label, ref in (inputs.get('pseudos') or {}).items():
+        if _pk(ref) is None:
+            continue
+        node_type = load_node(_pk(ref)).node_type
+        if not node_type.startswith('data.pseudo'):
+            raise ValueError('pseudo %r -> %r is a %s, not a pseudopotential' % (label, ref, node_type))
+
+    from aiida_agents.tools.execution.spec_execution import submit_process_spec as submit
+    from aiida_agents.tools.execution.submit import SubmissionInputError
+    try:
+        result = submit(spec)
+    except SubmissionInputError as error:
+        print(json.dumps({"kind": "submission_rejected", "stage": "validation", "submitted": False,
+                          "error": {"type": type(error).__name__, "message": str(error)}}))
+        sys.exit(0)
+    try:
+        structure = inputs.get('structure')
+        if isinstance(structure, dict):
+            structure = structure.get('pk')
+        result['formula'] = load_node(structure).get_formula() if structure else ''
+    except Exception:
+        result['formula'] = ''
+    print(json.dumps(result))
+    """
+
+
+    JUPYTER_URL = os.environ.get("JUPYTER_URL", "http://aiidalab:8888").rstrip("/")
+    JUPYTER_TOKEN = os.environ.get("JUPYTER_TOKEN", "")
+    PLUGIN_DIR = os.environ.get('AIIDA_PLUGIN_DIR', '/plugins')
+
+    NOTEBOOK_DIR = "notebooks"
+
+
+    def _notebook_name(path):
+        """Return a bare notebook filename; the Jupyter contents API sees nothing else.
+
+        These write files that Jupyter will later execute, so the notebook directory
+        is the boundary: no separators, no dot-segments, no leading dot.
+        """
+        if not isinstance(path, str) or not path.strip():
+            raise ValueError("path must be a non-empty notebook name")
+        name = path.strip()
+        if "/" in name or "\\" in name:
+            raise ValueError("path must be a filename inside notebooks/, not a path: %r" % path)
+        if name.startswith(".") or ".." in name:
+            raise ValueError("path must not start with a dot or contain '..': %r" % path)
+        if not name.endswith(".ipynb"):
+            name += ".ipynb"
+        return name
+
+
+    def _jupyter(method, endpoint, **kwargs):
+        if not JUPYTER_TOKEN:
+            raise RuntimeError("JUPYTER_TOKEN is not set; cannot reach the Jupyter server")
+        response = httpx.request(method, JUPYTER_URL + endpoint, timeout=30,
+                                 headers={"Authorization": "token " + JUPYTER_TOKEN}, **kwargs)
+        if response.status_code >= 400:
+            raise RuntimeError("Jupyter %s %s -> %s: %s" % (method, endpoint, response.status_code,
+                                                           response.text[:300]))
+        return response.json() if response.content else {}
+
+
+    _DIR_READY = []
+
+
+    def _ensure_notebook_dir():
+        """Create notebooks/ on first use: a fresh profile has no such directory."""
+        if _DIR_READY:
+            return
+        try:
+            _jupyter("PUT", "/api/contents/" + NOTEBOOK_DIR, json={"type": "directory"})
+        except RuntimeError as error:
+            if "409" not in str(error) and "already exists" not in str(error):
+                raise
+        _DIR_READY.append(True)
+
+
+    def get_notebook_source(path: str, max_cells: int = 40, max_source_bytes: int = 20000) -> dict:
+        """Read notebook cell sources only. Never execute cells or return their outputs.
+
+        Give a filename inside notebooks/ including .ipynb. At most 100 cells and
+        65536 UTF-8 source bytes may be returned; truncation and totals are explicit.
+        """
+        if not isinstance(path, str) or not path.endswith(".ipynb"):
+            raise ValueError("path must be a notebook filename ending in .ipynb")
+        name = _notebook_name(path)
+        if name != path:
+            raise ValueError("path must be an exact notebook filename without surrounding whitespace")
+        if "%" in name or any(ord(char) < 32 for char in name):
+            raise ValueError("notebook filename must not contain percent escapes or control characters")
+        for value, maximum, label in ((max_cells, 100, "max_cells"),
+                                       (max_source_bytes, 65536, "max_source_bytes")):
+            if type(value) is not int or not 1 <= value <= maximum:
+                raise ValueError("%s must be an integer between 1 and %s" % (label, maximum))
+        model = _jupyter("GET", "/api/contents/" + NOTEBOOK_DIR + "/" + quote(name, safe=""),
+                         params={"content": 1})
+        content = model.get("content") if isinstance(model, dict) else None
+        if (not isinstance(model, dict) or model.get("type") != "notebook"
+                or not isinstance(content, dict) or content.get("nbformat") != 4
+                or not isinstance(content.get("cells"), list)):
+            raise ValueError("Jupyter did not return a version 4 notebook")
+        sources = []
+        for cell in content["cells"]:
+            if not isinstance(cell, dict) or cell.get("cell_type") not in ("code", "markdown", "raw"):
+                raise ValueError("invalid notebook cell type")
+            source = cell.get("source", "")
+            if isinstance(source, list) and all(isinstance(line, str) for line in source):
+                source = "".join(source)
+            if not isinstance(source, str):
+                raise ValueError("invalid notebook cell source")
+            sources.append((cell["cell_type"], source.encode("utf-8")))
+        cells, returned = [], 0
+        for kind, source in sources[:max_cells]:
+            text = source[:max_source_bytes - returned].decode("utf-8", errors="ignore")
+            size = len(text.encode("utf-8"))
+            truncated = size < len(source)
+            cells.append({"type": kind, "source": text, "truncated": truncated})
+            returned += size
+            if truncated:
+                break
+        return {"path": NOTEBOOK_DIR + "/" + name, "provenance": "jupyter_contents",
+                "mtime": model.get("last_modified") if isinstance(model.get("last_modified"), str) else None,
+            "cell_count_total": len(sources), "cells": cells,
+                "source_bytes_total": sum(len(source) for _, source in sources),
+                "source_bytes_returned": returned,
+                "limits": {"max_cells": max_cells, "max_source_bytes": max_source_bytes},
+                "truncated": len(cells) < len(sources) or any(cell["truncated"] for cell in cells)}
+
+
+    def list_workspace(path: str = "") -> dict:
+        """List the notebooks the agent has written, with size and modification time."""
+        endpoint = "/api/contents/" + NOTEBOOK_DIR
+        if path:
+            endpoint += "/" + _notebook_name(path).rsplit(".ipynb", 1)[0]
+        listing = _jupyter("GET", endpoint)
+        entries = [{"name": item["name"], "is_dir": item["type"] == "directory",
+                    "size": item.get("size"), "mtime": item.get("last_modified")}
+                   for item in listing.get("content") or []]
+        return {"url_path": endpoint.replace("/api/contents", ""), "entries": entries}
+
+
+    JS_TOKENS = re.compile(r"(?<![\w.'\"])\b(true|false|null|undefined)\b(?![\w'\"])")
+
+
+    def _validate_cells(built):
+        """Reject cells that would fail in a Python kernel; the notebook is the product.
+
+        A bare `true` in a dict literal parses as a name, so ast.parse accepts it and
+        the cell only explodes at run time. Token-scan first, then parse, and name the
+        cell index so the caller can repair one cell rather than the whole notebook.
+        """
+        for index, cell in enumerate(built):
+            if cell.get("cell_type") != "code":
+                continue
+            source = "".join(cell.get("source") or [])
+            if not source.strip():
+                continue
+            for token in JS_TOKENS.findall(source):
+                raise ValueError(
+                    "cell %d is not Python: bare %r. Write True/False/None." % (index, token))
+            try:
+                ast.parse(source)
+            except SyntaxError as error:
+                raise ValueError("cell %d does not parse: %s (line %s)" % (
+                    index, error.msg, error.lineno))
+        return True
+
+
+    def write_notebook(path: str, cells: list, title: str = "") -> dict:
+        """Write an nbformat 4 notebook into notebooks/ through the Jupyter server.
+
+        cells is a list of {"type": "markdown"|"code", "source": "..."} objects.
+        Jupyter creates the file, so it appears in the AiiDAlab file browser.
+        """
+        name = _notebook_name(path)
+        _ensure_notebook_dir()
+        if not isinstance(cells, list):
+            raise ValueError("cells must be a list")
+        built = []
+        if title:
+            built.append({"cell_type": "markdown", "metadata": {},
+                          "source": ["# " + str(title).replace("\n", " ")]})
+        for cell in cells:
+            if not isinstance(cell, dict):
+                raise ValueError("each cell must be an object")
+            kind = cell.get("type", "code")
+            if kind not in ("code", "markdown"):
+                raise ValueError("cell type must be 'code' or 'markdown', got %r" % kind)
+            source = cell.get("source", "")
+            if not isinstance(source, str):
+                raise ValueError("cell source must be a string")
+            lines = source.splitlines(keepends=True) or [""]
+            if kind == "markdown":
+                built.append({"cell_type": "markdown", "metadata": {}, "source": lines})
+            else:
+                built.append({"cell_type": "code", "execution_count": None, "metadata": {},
+                              "outputs": [], "source": lines})
+        document = {"cells": built,
+                    "metadata": {"kernelspec": {"display_name": "Python 3", "language": "python",
+                                                "name": "python3"},
+                                 "language_info": {"name": "python"}},
+                    "nbformat": 4, "nbformat_minor": 5}
+        _validate_cells(built)
+        endpoint = "/api/contents/" + NOTEBOOK_DIR + "/" + name
+        saved = _jupyter("PUT", endpoint, json={"type": "notebook", "format": "json",
+                                                "content": document})
+        in_aiidalab = "/lab/tree/" + saved.get("path", "")
+        base = os.environ.get("JUPYTER_PUBLIC_URL", "https://@AIIDA_HOSTNAME@").rstrip("/")
+        return {"path": saved.get("path"), "cells": len(built), "size": saved.get("size"),
+                "in_aiidalab": in_aiidalab, "url": base + in_aiidalab}
+
+
+
+    CREATE = r"""
+    import json, sys
+    from aiida import load_profile
+    load_profile()
+    from aiida.orm import StructureData
+    spec = json.load(sys.stdin)
+    structure = StructureData(cell=spec["cell"])
+    for symbol, position in zip(spec["species"], spec["positions"]):
+        structure.append_atom(symbols=symbol, position=position)
+    if spec.get("name"):
+        structure.label = spec["name"]
+    structure.store()
+    print(json.dumps({"pk": structure.pk, "uuid": structure.uuid,
+                      "formula": structure.get_formula(), "sites": len(spec["species"])}))
+    """
+
+    CREATE_KPOINTS = r"""
+    import json, sys
+    from aiida import load_profile
+    load_profile()
+    from aiida.orm import KpointsData, load_node
+    spec = json.load(sys.stdin)
+    kpoints = KpointsData()
+    if spec.get("mesh"):
+        kpoints.set_kpoints_mesh(spec["mesh"])
+    else:
+        # A density is meaningless without the cell it refers to.
+        if spec.get("structure_pk"):
+            kpoints.set_cell_from_structure(load_node(spec["structure_pk"]))
+        elif spec.get("cell"):
+            kpoints.set_cell(spec["cell"])
+        else:
+            raise SystemExit("need structure_pk or cell to define the reciprocal cell")
+        kpoints.set_kpoints_mesh_from_density(spec["distance"])
+    if spec.get("name"):
+        kpoints.label = spec["name"]
+    kpoints.store()
+    print(json.dumps({"pk": kpoints.pk, "uuid": kpoints.uuid,
+                      "mesh": list(kpoints.get_kpoints_mesh()[0])}))
+    """
+
+
+    def create_kpoints(mesh: list = None, distance: float = None, structure: int = None,
+                       cell: list = None, name: str = "") -> dict:
+        """Create and store a KpointsData node, returning its pk and the mesh chosen.
+
+        Give exactly one of mesh (three integers) or distance (a reciprocal-space
+        density in 1/angstrom; 0.25-0.30 is the usual SSSP value). A distance needs a
+        cell to work on: pass structure (a StructureData pk) or cell (three vectors).
+        """
+        if (mesh is None) == (distance is None):
+            raise ValueError("give exactly one of mesh or distance")
+        if distance is not None:
+            try:
+                distance = float(distance)
+            except (TypeError, ValueError):
+                raise ValueError("distance must be a number, got %r" % (distance,))
+            if not 0.01 <= distance <= 1.0:
+                raise ValueError("distance %r is outside the sensible range 0.01-1.0 1/A" % distance)
+            if structure is None and cell is None:
+                raise ValueError("distance needs structure (a pk) or cell to define the reciprocal cell")
+        else:
+            if (not isinstance(mesh, (list, tuple)) or len(mesh) != 3
+                    or not all(isinstance(v, int) and 1 <= v <= 64 for v in mesh)):
+                raise ValueError("mesh must be three integers between 1 and 64, got %r" % (mesh,))
+            mesh = list(mesh)
+        payload = {"mesh": mesh, "distance": distance,
+                   "structure_pk": int(structure) if structure is not None else None,
+                   "cell": cell, "name": str(name)[:200] if name else ""}
+        p = subprocess.run([sys.executable, '-c', CREATE_KPOINTS], input=json.dumps(payload),
+                           capture_output=True, text=True, timeout=300)
+        if p.returncode != 0:
+            raise RuntimeError((p.stderr or p.stdout).strip()[-800:])
+        return json.loads(p.stdout)
+
+
+
+    EXPORT = r"""
+    import json, os, sys
+    from aiida import load_profile
+    load_profile()
+    from aiida.orm import CalcJobNode, load_node
+    pk, target = int(sys.argv[1]), sys.argv[2]
+    node = load_node(pk)
+    if not isinstance(node, CalcJobNode):
+        raise SystemExit("process %s is not a CalcJob; use the CalcJob pk, not its retrieved folder" % pk)
+    try:
+        retrieved = node.outputs.retrieved
+    except AttributeError:
+        raise SystemExit("CalcJob %s has no retrieved output" % pk) from None
+    os.makedirs(target, exist_ok=True)
+    for name in retrieved.list_object_names():
+        with retrieved.open(name, "rb") as handle, open(os.path.join(target, name), "wb") as out:
+            out.write(handle.read())
+    print(json.dumps({"dir": target, "files": retrieved.list_object_names()}))
+    """
+
+
+    def export_process_files(pk: int, limit_mb: int = 5) -> dict:
+        """Copy a CalcJob's retrieved files into a NEW notebooks/<pk>-files/ directory.
+
+        Refuse an existing destination before any PUT; never replace existing files.
+        The pk is the CalcJob's, not its retrieved FolderData node.
+        """
+        import shutil
+        import tempfile
+
+        directory = "%s-files" % int(pk)
+        endpoint = "/api/contents/%s/%s" % (NOTEBOOK_DIR, directory)
+        try:
+            _jupyter("GET", endpoint, params={"content": 0})
+        except RuntimeError as error:
+            if not str(error).startswith("Jupyter GET %s -> 404:" % endpoint):
+                raise
+        else:
+            raise ValueError("Export destination already exists; refusing to overwrite %s" % directory)
+
+        work = tempfile.mkdtemp()
+        try:
+            p = subprocess.run([sys.executable, "-c", EXPORT, str(int(pk)), work],
+                               capture_output=True, text=True, timeout=600)
+            if p.returncode != 0:
+                raise RuntimeError((p.stderr or p.stdout).strip()[-400:])
+            _ensure_notebook_dir()
+            _jupyter("PUT", endpoint, json={"type": "directory"})
+            written, skipped = [], []
+            for name in sorted(os.listdir(work)):
+                path = os.path.join(work, name)
+                size = os.path.getsize(path)
+                if size > limit_mb * 1024 * 1024:
+                    skipped.append({"name": name, "size": size, "reason": "over %d MB" % limit_mb})
+                    continue
+                with open(path, "rb") as handle:
+                    raw = handle.read()
+                try:
+                    text = raw.decode("utf-8")
+                    payload = {"type": "file", "format": "text", "content": text}
+                except UnicodeDecodeError:
+                    import base64
+                    payload = {"type": "file", "format": "base64",
+                               "content": base64.b64encode(raw).decode()}
+                _jupyter("PUT", endpoint + "/" + name, json=payload)
+                written.append({"name": name, "size": size,
+                                "url": _public_url("/lab/tree/%s/%s/%s" % (NOTEBOOK_DIR, directory, name))})
+            return {"pk": int(pk), "dir": directory, "files": written, "skipped": skipped,
+                    "url": _public_url("/lab/tree/%s/%s" % (NOTEBOOK_DIR, directory))}
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+
+
+    def _accept_skipped_initialized_notification():
+        """Let clients that skip `notifications/initialized` use the session anyway.
+
+        mcp 1.30 rejects any request that arrives before the InitializedNotification
+        with -32602, which is exactly what the OpenClaw runtime does on every
+        connection: initialize, then straight to tools/list. By then the session
+        exists -- we answered initialize and handed out a session id -- so the missing
+        notification carries no information, and the client cannot be fixed here.
+        Accept the request and mark the session initialized; initialize itself still
+        goes through the original handler unchanged.
+        """
+        from mcp.server import session as _session
+
+        original = _session.ServerSession._received_request
+
+        async def _patched(self, responder, *extra):
+            root = getattr(getattr(responder, "request", responder), "root", None)
+            state = getattr(self, "_initialization_state", None)
+            if (state == _session.InitializationState.Initializing
+                    and not isinstance(root, _session.types.InitializeRequest)):
+                self._initialization_state = _session.InitializationState.Initialized
+                print("accepted request before notifications/initialized: %s"
+                      % type(root).__name__, file=sys.stderr)
+            return await original(self, responder, *extra)
+
+        _session.ServerSession._received_request = _patched
+
+
+    def _public_url(path):
+        base = os.environ.get("JUPYTER_PUBLIC_URL", "https://@AIIDA_HOSTNAME@").rstrip("/")
+        return base + path
+
+    def create_structure(species: list, positions: list, cell: list, name: str = "") -> dict:
+        """Create and store a StructureData node, returning its pk.
+
+        species and positions are parallel lists; cell is three lattice vectors in
+        angstrom. This is the only way an agent can introduce a new structure: the
+        submit tool takes node references and nothing else.
+        """
+        if not isinstance(species, list) or not species:
+            raise ValueError("species must be a non-empty list of element symbols")
+        if not isinstance(positions, list) or len(positions) != len(species):
+            raise ValueError("positions must be a list the same length as species (%d)" % len(species))
+        if len(species) > 500:
+            raise ValueError("refusing to build %d sites; 500 is the ceiling for this tool" % len(species))
+        for symbol in species:
+            if not isinstance(symbol, str) or not symbol.strip() or len(symbol.strip()) > 3:
+                raise ValueError("bad element symbol %r" % (symbol,))
+        clean_positions = []
+        for site in positions:
+            if not isinstance(site, (list, tuple)) or len(site) != 3:
+                raise ValueError("each position must be three numbers, got %r" % (site,))
+            clean_positions.append([float(v) for v in site])
+        if not isinstance(cell, list) or len(cell) != 3:
+            raise ValueError("cell must be three lattice vectors")
+        clean_cell = []
+        for vector in cell:
+            if not isinstance(vector, (list, tuple)) or len(vector) != 3:
+                raise ValueError("each cell vector must be three numbers, got %r" % (vector,))
+            clean_cell.append([float(v) for v in vector])
+        payload = {"species": [s.strip() for s in species], "positions": clean_positions,
+                   "cell": clean_cell, "name": str(name)[:200] if name else ""}
+        p = subprocess.run([sys.executable, '-c', CREATE], input=json.dumps(payload),
+                           capture_output=True, text=True, timeout=300)
+        if p.returncode != 0:
+            raise RuntimeError((p.stderr or p.stdout).strip()[-800:])
+        return json.loads(p.stdout)
+
+
+    OUTPUTS = r"""
+    import json, sys
+    from aiida import load_profile
+    load_profile()
+    from aiida.orm import load_node
+    pk = int(sys.argv[1])
+    node = load_node(pk)
+    files = []
+    retrieved = node.outputs.get("retrieved")
+    if retrieved is not None:
+        for name in retrieved.list_object_names():
+            try:
+                files.append({"name": name, "size": retrieved.get_object_size(name)})
+            except Exception:
+                files.append({"name": name, "size": None})
+    excerpt = ""
+    try:
+        text = retrieved.get_object_content("aiida.out")
+        keep = []
+        for line in text.splitlines():
+            if any(mark in line for mark in ("highest occupied", "lowest unoccupied",
+                                             "convergence has been achieved", "estimated scf accuracy",
+                                             "total energy", "JOB DONE", "End of self-consistent")):
+                keep.append(line.strip())
+        excerpt = "\n".join(keep[-14:])
+    except Exception as error:
+        excerpt = "aiida.out unavailable: %s" % error
+    print(json.dumps({"state": str(node.process_state), "exit_status": node.exit_status,
+                      "files": files, "excerpt": excerpt}))
+    """
+
+
+    def _outputs_summary(pk):
+        p = subprocess.run([sys.executable, "-c", OUTPUTS, str(int(pk))],
+                           capture_output=True, text=True, timeout=300)
+        if p.returncode != 0:
+            raise RuntimeError((p.stderr or p.stdout).strip()[-400:])
+        return json.loads(p.stdout)
+
+    def _repro_cells(spec, result):
+        """Rebuild from stored inputs, not the caller's lossy serialized spec."""
+        pk = result.get("pk")
+        if pk is None:
+            raise ValueError("a submitted process pk is required for its notebook")
+        expected_uuid = result.get("uuid")
+        inspect = "\n".join([
+            "from aiida import load_profile",
+            "load_profile()",
+            "from aiida.orm import load_node",
+            "",
+            "original = load_node(%r)" % pk,
+            "expected_uuid = %r" % expected_uuid,
+            "if expected_uuid and str(original.uuid) != str(expected_uuid):",
+            "    raise ValueError('Process UUID does not match this notebook')",
+            "print('Original process:', original.pk, original.uuid, original.process_type)",
+            "print('State:', original.process_state, 'exit status:', original.exit_status)",
+            "",
+            "def show_inputs(namespace, prefix=''):",
+            "    for name in namespace:",
+            "        value = namespace[name]",
+            "        path = prefix + name",
+            "        if hasattr(value, 'uuid'):",
+            "            print(path, 'pk:', value.pk, 'uuid:', value.uuid, 'label:', value.label)",
+            "            if hasattr(value, 'get_formula') and hasattr(value, 'sites'):",
+            "                print('Formula:', value.get_formula(), 'cell (Angstrom):', value.cell)",
+            "                for site in value.sites:",
+            "                    print('Site:', site.kind_name, 'position (Angstrom):', site.position)",
+            "            elif hasattr(value, 'get_dict'):",
+            "                print(value.get_dict())",
+            "        elif hasattr(value, 'items'):",
+            "            show_inputs(value, path + '.')",
+            "        else:",
+            "            print(path, value)",
+            "",
+            "show_inputs(original.inputs)",
+        ])
+        rerun = "\n".join([
+            "# Run All is read-only by default. Enabling this creates a NEW process/job.",
+            "ALLOW_RERUN = False",
+            'RERUN_CONFIRMATION = ""',
+            "if ALLOW_RERUN:",
+            '    if RERUN_CONFIRMATION != "SUBMIT NEW PROCESS":',
+            "        raise ValueError('Set RERUN_CONFIRMATION to SUBMIT NEW PROCESS only after compute approval')",
+            "    from aiida.engine import submit",
+            "    builder = original.get_builder_restart()",
+            "    process = submit(builder)",
+            "    print('New process:', process.pk, process.uuid)",
+            "else:",
+            "    print('No job submitted. Review inputs and obtain compute approval before enabling ALLOW_RERUN.')",
+        ])
+        outputs = "\n".join([
+            "print('Original state:', original.process_state, 'exit status:', original.exit_status)",
+            "for name in original.outputs:",
+            "    value = original.outputs[name]",
+            "    print('Output:', name, 'pk:', getattr(value, 'pk', None))",
+            "    if hasattr(value, 'get_dict'):",
+            "        print(value.get_dict())  # Keep energy values and their recorded units together.",
+            "retrieved = getattr(original.outputs, 'retrieved', None)",
+            "if retrieved is not None:",
+            "    print('Retrieved files:', retrieved.list_object_names())",
+            "    if 'aiida.out' in retrieved.list_object_names():",
+            "        print(retrieved.get_object_content('aiida.out')[-1200:])",
+            "else:",
+            "    print('No directly linked retrieved folder. A workflow may expose results through child processes.')",
+        ])
+        return [
+            {"type": "markdown", "source": "# Process %s — %s\n\nRecorded label/formula: %s. "
+                "The cells below display the actual stored inputs; a label is not a geometry validation." % (
+                    pk, spec.get("entry_point") or "stored process", result.get("formula") or "not supplied")},
+            {"type": "markdown", "source": "## Inspect and rebuild\n\nThis is a same-profile restart notebook, "
+                "not a standalone portable archive. It requires the original AiiDA profile, repository, "
+                "input nodes, installed process plugins, code and compute environment. Native restart "
+                "semantics preserve CalcJob or WorkChain inputs, including nested node references and options. "
+                "Review actual species, cell, positions, parameters and resources before any rerun."},
+            {"type": "code", "source": inspect},
+            {"type": "markdown", "source": "## Optional rerun — explicit approval required\n\nRun All does not "
+                "submit. Only after compute approval, set ALLOW_RERUN to True and RERUN_CONFIRMATION "
+                "to SUBMIT NEW PROCESS. This confirmation is a UX guard, not authorization. "
+                "The new pk is separate from the original process and its outputs below."},
+            {"type": "code", "source": rerun},
+            {"type": "markdown", "source": "## Original outputs\n\nQueued/running processes may not have outputs yet. "
+                "Failed or killed processes are not successful results. Read the recorded state and exit status; "
+                "keep parsed energy units with values and compare them with raw output units."},
+            {"type": "code", "source": outputs},
+        ]
+
+
+    def _notebook_name_for(result):
+        formula = re.sub(r"[^a-z0-9-]+", "-", str(result.get("formula") or "run").lower()).strip("-") or "run"
+        return "%s-%s" % (int(result["pk"]), formula)
+
+
+    def _write_repro_notebook(spec, result):
+        """Write the notebook once or raise, retaining the caller's submitted-pk recovery path."""
+        cells = _repro_cells(spec, result)
+        return write_notebook(_notebook_name_for(result), cells,
+                              title="%s %s" % (result.get("formula") or "Process", result.get("pk")))
+
+
+    def _check(spec):
+        from aiida.common.exceptions import MissingEntryPointError
+        from aiida.plugins import CalculationFactory, WorkflowFactory
+        from plumpy.ports import PortNamespace
+
+        if not isinstance(spec, dict):
+            raise TypeError('spec must be a dictionary, got %s' % type(spec).__name__)
+        inputs = spec.get('inputs')
+        if not isinstance(inputs, dict) or not inputs:
+            raise ValueError("spec is missing required 'inputs' dictionary")
+        entry_point = spec.get('entry_point')
+        if not isinstance(entry_point, str) or not entry_point:
+            raise ValueError("spec is missing required 'entry_point' string")
+        try:
+            process_class = CalculationFactory(entry_point)
+        except MissingEntryPointError:
+            try:
+                process_class = WorkflowFactory(entry_point)
+            except MissingEntryPointError as error:
+                raise ValueError('unknown process entry_point: %s' % entry_point) from error
+            except Exception as error:
+                raise ValueError('process entry_point failed to load (%s)' % type(error).__name__) from error
+        except Exception as error:
+            raise ValueError('process entry_point failed to load (%s)' % type(error).__name__) from error
+
+        def check_namespace(values, namespace, path):
+            if not isinstance(values, dict):
+                return  # The native process validator reports the invalid type.
+            for name, value in values.items():
+                port = namespace.get(name)
+                current = path + '.' + name if path else name
+                if isinstance(port, PortNamespace):
+                    if name == 'options' and path.endswith('metadata'):
+                        if not isinstance(value, dict):
+                            raise ValueError(current + ' must be a dictionary')
+                        refused = sorted(k for k in FORBIDDEN if k in value)
+                        if refused:
+                            raise ValueError('refused %s keys: %s' % (current, ', '.join(refused)))
+                        if value.get('import_sys_environment') is True:
+                            raise ValueError(current + '.import_sys_environment must not be true: slurmd runs rootless')
+                    check_namespace(value, port, current)
+                elif name == 'settings' and port is not None:
+                    settings = value
+                    if isinstance(value, dict) and any(k in value for k in ('pk', 'uuid', 'label')):
+                        from aiida.orm import load_node
+                        reference = next(value[k] for k in ('pk', 'uuid', 'label') if k in value)
+                        settings = load_node(reference).get_dict()
+                    if isinstance(settings, dict):
+                        refused = sorted(k for k in FORBIDDEN_SETTINGS if k in settings)
+                        if refused:
+                            raise ValueError('refused %s keys: %s' % (current, ', '.join(refused)))
+
+        check_namespace(inputs, process_class.spec().inputs, '')
+        # Do not add CalcJob ports to a WorkChain. The rootless Slurm scheduler
+        # override applies import_sys_environment=False to every actual job,
+        # including CalcJobs created internally by a WorkChain.
+        return spec
+
+
+    def submit_process_spec(spec: dict) -> dict:
+        """Submit an AiiDA process spec to the daemon and return its pk.
+
+        The submission runs in a child process: AiiDA re-attaches the profile user
+        on the calling thread, which fails on a second submission in one process.
+        """
+        from fastmcp.exceptions import ToolError
+
+        try:
+            spec = _check(spec)
+        except (TypeError, ValueError) as error:
+            raise ToolError(json.dumps({"kind": "submission_rejected", "stage": "validation",
+                                       "submitted": False, "error": {"type": type(error).__name__,
+                                       "message": str(error)}})) from error
+        try:
+            p = subprocess.run([sys.executable, '-c', SUB], input=json.dumps(spec),
+                               capture_output=True, text=True, timeout=900)
+        except subprocess.TimeoutExpired as error:
+            raise ToolError(json.dumps({"kind": "submission_unknown", "stage": "submission",
+                                       "submitted": None, "retry_safe": False,
+                                       "error": {"type": "TimeoutExpired", "message":
+                                       "The child did not return. Reconcile existing processes before retrying."}})) from error
+        if p.returncode != 0:
+            raise ToolError(json.dumps({"kind": "submission_unknown", "stage": "submission",
+                                       "submitted": None, "retry_safe": False,
+                                       "error": {"type": "ChildProcessError", "message":
+                                       "Submission child exited without a reliable result (exit %s). "
+                                       "Reconcile existing processes before retrying." % p.returncode}}))
+        try:
+            result = json.loads(p.stdout)
+            if not isinstance(result, dict):
+                raise ValueError('submission response must be an object')
+            if result.get("kind") != "submission_rejected" and (
+                    not isinstance(result.get("pk"), int) or isinstance(result.get("pk"), bool)
+                    or result["pk"] <= 0):
+                raise ValueError('submission response has no valid process identifier')
+        except (ValueError, TypeError) as error:
+            raise ToolError(json.dumps({"kind": "submission_unknown", "stage": "submission",
+                                       "submitted": None, "retry_safe": False,
+                                       "error": {"type": "InvalidChildResponse", "message":
+                                       "Submission child returned an invalid result. "
+                                       "Reconcile existing processes before retrying."}})) from error
+        if result.get("kind") == "submission_rejected":
+            raise ToolError(json.dumps(result))
+        # The reproducibility guarantee lives here, not in a prompt: a submission is
+        # not successful unless its notebook exists in AiiDAlab.
+        try:
+            notebook = _write_repro_notebook(spec, result)
+        except Exception as error:
+            return {"kind": "repro_notebook_required",
+                    "pk": result.get("pk"), "state": result.get("state"),
+                    "error": str(error)[-400:],
+                    "retry": "the process exists but its notebook does not. Call "
+                             "write_notebook with a name of the form '<pk>-<label>' and "
+                             "the cells the agent would have written, then report that url."}
+        result["notebook"] = notebook
+        result["url"] = notebook.get("url")
+        return result
+
+
+    def main():
+        m = get_mcp()
+        m.tool()(to_mcp_tool_error(export_process_files))
+        m.tool()(to_mcp_tool_error(create_kpoints))
+        m.tool()(to_mcp_tool_error(create_structure))
+        m.tool()(to_mcp_tool_error(submit_process_spec))
+        m.tool()(to_mcp_tool_error(write_notebook))
+        m.tool()(to_mcp_tool_error(list_workspace))
+        m.tool()(to_mcp_tool_error(get_notebook_source))
+
+        import pane
+
+        pane.register(m, notebook_name_for=_notebook_name_for, public_url=_public_url,
+                      list_workspace=list_workspace, submit_process_spec=submit_process_spec)
+        import band_summary
+
+        band_summary.register(m)
+        import retrieved_head
+        retrieved_head.register(m)
+        import workspace_fs
+        workspace_fs.register(m, jupyter=_jupyter, notebook_dir=NOTEBOOK_DIR, public_url=_public_url)
+        _accept_skipped_initialized_notification()
+        m.run(transport="stdio")
+
+
+    if __name__ == "__main__":
+        main()
+
+  pane.py: |
+
+    """OpenClaw pane tools: browse, open, run, tail — read + run over the substrate.
+
+    Layering: submits go through submit_process_spec (its own subprocess), never
+    in-process, because AiiDA re-attaches the profile user on the calling thread and
+    a second submission in one process fails. Reads compose in-process from
+    aiida_agents.tools, like the rest of the server.
+    """
+
+    import json
+    import os
+    from urllib.parse import quote
+
+    from aiida_agents.mcp.tools import to_mcp_tool_error
+
+
+    _callbacks = {}
+
+
+    def _tools():
+        from aiida_agents import tools as t
+        return t
+
+
+    def _ident(agent_id, conversation_id, requested_by):
+        return {"agent_id": agent_id, "conversation_id": conversation_id,
+                "requested_by": requested_by}
+
+
+    def _envelope(kind, identity, **fields):
+        out = {"kind": kind}
+        out.update(identity)
+        for key in ("pk", "uuid", "label", "process_type", "process_state",
+                    "exit_status", "mtime", "url", "permalink_hint"):
+            out.setdefault(key, None)
+        out.update(fields)
+        return out
+
+
+    def _ref_pk(ref):
+        if isinstance(ref, dict):
+            value = ref.get("pk") or ref.get("uuid")
+        else:
+            value = ref
+        if value is None:
+            raise ValueError("ref must carry pk or uuid")
+        return str(value)
+
+
+    def _notebook_url(pk, listing=None):
+        # A process class/label is not a notebook filename. Only link existing files.
+        if listing is None:
+            listing = _callbacks["list_workspace"]()
+        if not isinstance(listing, dict) or not isinstance(listing.get("entries"), list):
+            raise ValueError("invalid notebook inventory")
+        prefix = str(pk) + "-" if pk is not None else None
+        matches = sorted({entry["name"] for entry in listing["entries"]
+                          if isinstance(entry, dict) and isinstance(entry.get("name"), str)
+                          and not entry.get("is_dir") and prefix
+                          and entry["name"].startswith(prefix)
+                          and entry["name"].endswith(".ipynb")
+                          and "/" not in entry["name"] and "\\" not in entry["name"]})
+        status = "available" if len(matches) == 1 else "ambiguous" if matches else "not_found"
+        name = matches[0] if len(matches) == 1 else None
+        url = _callbacks["public_url"]("/lab/tree/notebooks/" + quote(name, safe="")) if name else None
+        return {"name": name, "url": url, "status": status, "matches": matches}
+
+
+    def aiidalab_browse(kind: str = "processes", label: str = None, state: str = None,
+                        limit: int = 25, ref: dict = None, agent_id: str = None,
+                        conversation_id: str = None, requested_by: str = None):
+        """List processes, the notebook workspace, or one process's retrieved files."""
+        identity = _ident(agent_id, conversation_id, requested_by)
+        t = _tools()
+        if kind == "workspace":
+            listing = _callbacks["list_workspace"]()
+            base = os.environ.get("JUPYTER_PUBLIC_URL", "https://@AIIDA_HOSTNAME@").rstrip("/")
+            entries = [dict(e, url=base + "/lab/tree/notebooks/" + e["name"]) for e in listing["entries"]]
+            return _envelope("workspace", identity, entries=entries,
+                             url=base + listing["url_path"])
+        if kind == "files":
+            if not ref:
+                raise ValueError("kind='files' needs ref={pk|uuid}")
+            identifier = _ref_pk(ref)
+            files = t.list_retrieved_files(identifier)
+            rows = files if isinstance(files, list) else files.get("files", [])
+            return _envelope("files", identity, pk=None, files=rows,
+                             permalink_hint="call export_process_files to make these browsable")
+        if kind != "processes":
+            raise ValueError("kind must be processes, workspace or files")
+        rows = t.list_recent_processes(limit=int(limit))
+        rows = rows if isinstance(rows, list) else rows.get("processes", [])
+        out = []
+        listing = _callbacks["list_workspace"]()
+        for row in rows:
+            if label and label.lower() not in str(row.get("label") or row.get("process_label") or "").lower():
+                continue
+            if state and str(row.get("state") or row.get("process_state") or "").lower() != state.lower():
+                continue
+            pk = row.get("pk")
+            notebook = _notebook_url(pk, listing)
+            out.append(_envelope("process", identity, pk=pk, uuid=row.get("uuid"),
+                                 label=row.get("label") or row.get("process_label"),
+                                 process_type=row.get("process_type"),
+                                 process_state=row.get("state") or row.get("process_state"),
+                                 exit_status=row.get("exit_status"),
+                                 url=notebook["url"], notebook=notebook["name"],
+                                 notebook_status=notebook["status"], notebook_matches=notebook["matches"]))
+        return _envelope("process", identity, entries=out, count=len(out))
+
+
+    def aiidalab_open(ref: dict, agent_id: str = None, conversation_id: str = None,
+                      requested_by: str = None):
+        """Everything about one process: inputs, outputs, retrieved files, notebook."""
+        identity = _ident(agent_id, conversation_id, requested_by)
+        identifier = _ref_pk(ref)
+        t = _tools()
+        status = t.get_process_status(identifier)
+        pk = status.get("pk") if isinstance(status, dict) else None
+        inputs, outputs = t.get_node_inputs(identifier), t.get_node_outputs(identifier)
+        retrieved = t.list_retrieved_files(identifier)
+        notebook = _notebook_url(pk)
+        return _envelope("process", identity, pk=pk, uuid=(status or {}).get("uuid"),
+                         label=(status or {}).get("process_label"),
+                         process_type=(status or {}).get("process_type"),
+                         process_state=(status or {}).get("state"),
+                         exit_status=(status or {}).get("exit_status"),
+                         url=notebook["url"], notebook=notebook,
+                         inputs=inputs, outputs=outputs, retrieved=retrieved)
+
+
+    def aiidalab_run(ref: dict = None, changes: dict = None, spec: dict = None,
+                     entry_point: str = None, wait: bool = False, timeout_seconds: int = 1800,
+                     agent_id: str = None, conversation_id: str = None, requested_by: str = None):
+        """Run a calculation: a full spec, a resubmit of an old one with changes, or a draft."""
+        identity = _ident(agent_id, conversation_id, requested_by)
+        submit_process_spec = _callbacks["submit_process_spec"]
+        t = _tools()
+        if spec is None:
+            if ref is not None:
+                built = t.build_resubmission_spec(_ref_pk(ref), overrides=changes or {})
+                spec = built.get("spec", built) if isinstance(built, dict) else built
+            elif entry_point:
+                spec = t.draft_process_inputs(entry_point, inputs=changes or {})
+                if isinstance(spec, dict) and "spec" in spec:
+                    spec = spec["spec"]
+                return _envelope("run", identity, draft=spec,
+                                 permalink_hint="call aiidalab_run(spec=...) to submit this draft")
+            else:
+                raise ValueError("give spec, or ref with changes, or entry_point with changes")
+        result = submit_process_spec(spec)
+        pk = result.get("pk")
+        summary = result
+        if wait and pk is not None:
+            try:
+                t.wait_for_process(str(pk), timeout_seconds=int(timeout_seconds))
+            except Exception:
+                pass
+            summary = t.get_process_status(str(pk))
+        notebook = result.get("notebook") or {}
+        return _envelope("run", identity, pk=pk, uuid=result.get("uuid"),
+                         process_state=(summary or {}).get("state") or result.get("state"),
+                         exit_status=(summary or {}).get("exit_status"),
+                         url=notebook.get("url") or result.get("url"), notebook=notebook)
+
+
+    def aiidalab_tail(ref: dict, follow: bool = False, n: int = 30, follow_seconds: int = 120,
+                      agent_id: str = None, conversation_id: str = None, requested_by: str = None):
+        """The last lines of the scheduler output and the process log, without a file browser."""
+        identity = _ident(agent_id, conversation_id, requested_by)
+        identifier = _ref_pk(ref)
+        t = _tools()
+        if follow:
+            try:
+                t.wait_for_process(identifier, timeout_seconds=int(follow_seconds))
+            except Exception:
+                pass
+        status = t.get_process_status(identifier) or {}
+        try:
+            report = t.get_process_report(identifier, levelname="REPORT")
+        except Exception:
+            report = None
+
+        def tail(filename):
+            try:
+                got = t.get_retrieved_file(identifier, filename, tail_lines=int(n))
+                return got if not isinstance(got, dict) else got.get("content") or got.get("lines")
+            except Exception as error:
+                return None
+
+        pk = status.get("pk")
+        notebook = _notebook_url(pk)
+        return _envelope("tail", identity, pk=pk, uuid=status.get("uuid"),
+                         label=status.get("process_label"),
+                         process_type=status.get("process_type"),
+                         process_state=status.get("state"),
+                         exit_status=status.get("exit_status"),
+                         url=notebook["url"], notebook=notebook, aiida_out_tail=tail("aiida.out"),
+                         scheduler_stdout_tail=tail("_scheduler-stdout.txt"),
+                         logs_tail=report)
+
+
+    def register(mcp, *, notebook_name_for, public_url, list_workspace, submit_process_spec):
+        _callbacks.update(notebook_name_for=notebook_name_for, public_url=public_url,
+                          list_workspace=list_workspace, submit_process_spec=submit_process_spec)
+        for fn in (aiidalab_browse, aiidalab_open, aiidalab_run, aiidalab_tail):
+            mcp.tool()(to_mcp_tool_error(fn))
+  front.py: |
+    import os, signal, subprocess, sys, time
+    import httpx, uvicorn
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse, StreamingResponse
+    from starlette.routing import Route
+
+    TOKEN = os.environ.get("AIIDA_MCP_TOKEN", "")
+    if len(TOKEN) < 16:
+        sys.exit("AIIDA_MCP_TOKEN missing or too short; refusing to serve unauthenticated MCP")
+    UPSTREAM = "http://127.0.0.1:8081"
+    SKIP = {"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade",
+            "proxy-authorization", "proxy-authenticate", "host", "content-length"}
+
+    # --pass-environment: mcp-proxy hands the child only HOME/PATH/LC_CTYPE by
+    # default, and the tools need JUPYTER_URL, JUPYTER_TOKEN and PYTHONPATH.
+    proxy = subprocess.Popen(["/opt/venvs/agents/bin/mcp-proxy", "--host", "127.0.0.1",
+                              "--port", "8081", "--pass-environment", "--",
+                              "/opt/venvs/agents/bin/python", "/opt/mcp/server.py"])
+
+
+    def bye(*_):
+        proxy.terminate()
+        sys.exit(0)
+
+
+    signal.signal(signal.SIGTERM, bye)
+    signal.signal(signal.SIGINT, bye)
+
+
+    async def endpoint(request):
+        header = request.headers.get("authorization", "")
+        if header != "Bearer " + TOKEN:
+            return JSONResponse({"jsonrpc": "2.0", "error": {"code": -32001, "message": "unauthorized"}},
+                                status_code=401, headers={"WWW-Authenticate": "Bearer"})
+        body = await request.body()
+        headers = {k: v for k, v in request.headers.items() if k.lower() not in SKIP}
+        url = UPSTREAM + request.url.path + (("?" + request.url.query) if request.url.query else "")
+        client = httpx.AsyncClient(timeout=None)
+        upstream = await client.send(client.build_request(request.method, url, headers=headers, content=body),
+                                     stream=True)
+
+        async def body_iter():
+            try:
+                async for chunk in upstream.aiter_raw():
+                    yield chunk
+            finally:
+                await upstream.aclose()
+                await client.aclose()
+
+        return StreamingResponse(body_iter(), status_code=upstream.status_code,
+                                 headers={k: v for k, v in upstream.headers.items() if k.lower() not in SKIP})
+
+
+    app = Starlette(routes=[Route("/{path:path}", endpoint,
+                                  methods=["GET", "POST", "DELETE", "OPTIONS"])])
+    uvicorn.run(app, host="0.0.0.0", port=8080, log_level="warning")
+  band_summary.py: |
+    """Read-only, sampled-path band edges for non-spin fixed-occupation BandsData."""
+    import math
+    import numpy as np
+    from aiida.orm import BandsData, load_node
+    from aiida_agents.tools._types import Identifier
+
+
+    def summarize(node, *, n_electrons=None, n_occupied=None, evidence=None):
+        evidence = evidence or {}
+        bands = np.asarray(node.get_bands(), dtype=float)
+        points = np.asarray(node.get_kpoints(), dtype=float)
+        if bands.ndim != 2:
+            raise ValueError("Only non-spin 2D band arrays are supported")
+        if evidence.get("lsda") is not False or evidence.get("non_colinear_calculation") is not False or evidence.get("spin_orbit_calculation") is not False:
+            raise ValueError("Verified non-spin, non-collinear=False and spin-orbit=False creator metadata is required")
+        if evidence.get("number_of_spin_components", 1) != 1:
+            raise ValueError("Spin-polarized, spinor and spin-orbit results are unsupported")
+        if node.units != "eV":
+            raise ValueError("Only stored eV band energies are supported")
+        if not bands.size or points.shape != (bands.shape[0], 3) or not np.isfinite(bands).all() or not np.isfinite(points).all():
+            raise ValueError("Band energies and fractional k-points must be finite and shape-compatible")
+        if np.any(np.diff(bands, axis=1) < 0):
+            raise ValueError("Band energies must be ordered within every k-point")
+        if n_occupied is not None and n_electrons is not None:
+            raise ValueError("Supply either n_occupied or n_electrons, not both")
+        source = "explicit_n_occupied"
+        if n_occupied is None:
+            source = "explicit_n_electrons" if n_electrons is not None else "creator_output_parameters.number_of_electrons"
+            electrons = n_electrons if n_electrons is not None else evidence.get("number_of_electrons")
+            if isinstance(electrons, bool) or not isinstance(electrons, (int, float)) or not math.isfinite(electrons) or electrons <= 0 or electrons % 2:
+                raise ValueError("Supply an occupied-band count or an even electron count for a non-spin fixed-occupation result")
+            n_occupied = int(electrons / 2)
+        if isinstance(n_occupied, bool) or not isinstance(n_occupied, int) or not 0 < n_occupied < bands.shape[1]:
+            raise ValueError("n_occupied must leave both occupied and empty bands in the stored array")
+        creator_electrons = evidence.get("number_of_electrons")
+        if creator_electrons is not None and creator_electrons != 2 * n_occupied:
+            raise ValueError("Occupied count contradicts creator electron count")
+        if evidence.get("occupations") != "fixed":
+            raise ValueError("Verified fixed occupations are required; smearing or unknown occupation mode is unsupported")
+        try:
+            _, occupations = node.get_bands(also_occupations=True)
+        except AttributeError:
+            occupations = None
+        if occupations is not None:
+            occupations = np.asarray(occupations, dtype=float)
+            if occupations.shape != bands.shape or not np.allclose(occupations[:, :n_occupied], 2, atol=1e-6, rtol=0) or not np.allclose(occupations[:, n_occupied:], 0, atol=1e-6, rtol=0):
+                raise ValueError("Stored occupations do not support the requested non-spin fixed occupied-band partition")
+        elif evidence.get("occupations") not in (None, "fixed"):
+            raise ValueError("Missing occupations for a non-fixed-occupation result")
+        labels = list(node.labels or [])
+        label_map = dict(labels)
+        valence = bands[:, n_occupied - 1]
+        conduction = bands[:, n_occupied]
+        vi, ci, di = int(np.argmax(valence)), int(np.argmin(conduction)), int(np.argmin(conduction - valence))
+        vbm = float(valence[vi])
+        def edge(energy, index, band_index):
+            return {"energy": float(energy), "k_index": index, "band_index": band_index, "k_frac": points[index].tolist(), "label": label_map.get(index)}
+        candidates = [{"source": "BandsData.array_vbm", "energy": vbm, "units": "eV"}]
+        for key in ("fermi_energy", "highest_occupied_level"):
+            value = evidence.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and evidence.get(key + "_units") == "eV":
+                candidates.append({"source": "creator_output_parameters." + key, "energy": value, "units": "eV"})
+        segments = evidence.get("explicit_segments")
+        breaks = None
+        if segments is not None:
+            if not segments or any(len(s) != 2 or any(isinstance(i, bool) or not isinstance(i, int) for i in s) or not 0 <= s[0] < s[1] <= bands.shape[0] for s in segments):
+                raise ValueError("Invalid explicit segment metadata")
+            breaks = []
+            for previous, current in zip(segments, segments[1:]):
+                if previous[1] == current[0]:
+                    breaks.append(current[0])
+                elif previous[1] != current[0] + 1:
+                    raise ValueError("Explicit segments do not describe a continuous or discontinuous sampled path")
+        return {
+            "pk": node.pk, "uuid": str(node.uuid), "units": node.units,
+            "n_kpoints": bands.shape[0], "n_bands": bands.shape[1], "n_occupied": n_occupied,
+            "occupied_count_source": source,
+            "occupations_verified": occupations is not None,
+            "occupation_assumption": None if occupations is not None else "Non-spin, fixed occupied-band partition; not inferred from energy ordering",
+            "VBM": edge(valence[vi], vi, n_occupied - 1), "CBM": edge(conduction[ci], ci, n_occupied),
+            "minimum_direct_gap": {"energy": float(conduction[di] - valence[di]), "k_index": di},
+            "indirect_gap": float(conduction[ci] - vbm),
+            "reference_energy_candidates": candidates,
+            "zero_reference": {"source": "BandsData.array_vbm", "energy": vbm, "units": "eV", "operation": "subtract from stored energies"},
+            "absolute_energy_reference": "unknown; stored eigenvalues do not define a vacuum reference",
+            "label_numbers": [int(i) for i, _ in labels], "labels": [s for _, s in labels],
+            "segment_break_indices": breaks,
+            "segment_break_source": evidence.get("segment_source") if segments is not None else "unavailable: no linked explicit-segment metadata; no label-adjacency inference",
+            "explicit_segments": segments,
+            "edge_selection": "First representative of exact equal extrema; no degeneracy grouping or tolerance applied",
+            "sampled_path_only": True, "global_brillouin_zone_gap": False,
+            "provenance": evidence.get("provenance", {}),
+        }
+
+
+    def get_band_edge_summary(identifier: Identifier, n_electrons: int | None = None, n_occupied: int | None = None) -> dict:
+        """Read sampled-path band edges from stored BandsData (pk/UUID/label). No submission, writes or execution. Non-spin, fixed occupations only. Indices are zero-based; gap is not a global Brillouin-zone claim. Choose n_occupied OR an even n_electrons if provenance lacks a count."""
+        from fastmcp.exceptions import ToolError
+        try:
+            node = load_node(identifier)
+            if not isinstance(node, BandsData):
+                raise ValueError("identifier must select BandsData, not its WorkChain or CalcJob")
+            evidence = {}
+            creator = node.creator
+            if creator is not None:
+                evidence["provenance"] = {"creator_pk": creator.pk, "creator_uuid": str(creator.uuid)}
+                try:
+                    parameters = creator.outputs.output_parameters.get_dict()
+                except (AttributeError, KeyError):
+                    parameters = {}
+                for key in ("number_of_electrons", "number_of_spin_components", "lsda", "spin_polarized", "non_colinear_calculation", "spin_orbit_calculation", "fermi_energy", "fermi_energy_units", "highest_occupied_level", "highest_occupied_level_units"):
+                    if key in parameters:
+                        evidence[key] = parameters[key]
+                try:
+                    evidence["occupations"] = creator.inputs.parameters.get_dict().get("SYSTEM", {}).get("occupations")
+                except (AttributeError, KeyError):
+                    pass
+                try:
+                    kpoints = creator.inputs.kpoints
+                    path_creator = kpoints.creator
+                    if path_creator is not None:
+                        path_parameters = path_creator.outputs.parameters
+                        path_data = path_parameters.get_dict()
+                        explicit_points = np.asarray(kpoints.get_kpoints(), dtype=float)
+                        # The creator must identify these very k-points as its explicit path output.
+                        same_output = path_creator.outputs.explicit_kpoints.pk == kpoints.pk
+                        if same_output and explicit_points.shape == np.asarray(node.get_kpoints()).shape and np.allclose(explicit_points, node.get_kpoints(), atol=1e-8, rtol=0):
+                            evidence["explicit_segments"] = path_data.get("explicit_segments")
+                            evidence["segment_source"] = {"path_creator_pk": path_creator.pk, "parameters_pk": path_parameters.pk, "field": "explicit_segments", "end_exclusive": True, "fractional_coordinate_atol": 1e-8}
+                except (AttributeError, KeyError):
+                    pass
+            return summarize(node, n_electrons=n_electrons, n_occupied=n_occupied, evidence=evidence)
+        except (ValueError, TypeError) as exc:
+            raise ToolError(str(exc)) from exc
+
+
+    def register(mcp):
+        mcp.tool(get_band_edge_summary)
+
+  retrieved_head.py: |
+    """Bounded first-line reads of a CalcJob's exact retrieved file."""
+    from aiida_agents.tools._types import Identifier
+    from aiida_agents.tools.processes import _retrieved_folder
+    from aiida.common.exceptions import NotExistent
+    from fastmcp.exceptions import ToolError
+
+    MAX_BYTES = 20000
+
+
+    def _read_head(stream, head_lines):
+        # One sentinel byte establishes omission without scanning a large file.
+        raw = stream.read(MAX_BYTES + 1)
+        capped = len(raw) > MAX_BYTES
+        bounded = raw[:MAX_BYTES]
+        lines = bounded.splitlines(keepends=True)
+        selected = lines[:head_lines]
+        content_bytes = b"".join(selected)
+        omitted = capped or len(lines) > head_lines
+        return {
+            "content": content_bytes.decode("utf-8", errors="replace"),
+            "head_lines_requested": head_lines,
+            "lines_returned": len(selected),
+            "truncated": omitted,
+            "selection": "head",
+            "bytes_read": len(raw),
+            "max_bytes": MAX_BYTES,
+            "lines_total": None,
+        }
+
+
+    def get_retrieved_file_head(identifier: Identifier, filename: str, head_lines: int = 12) -> dict:
+        """Read the first 1..100 lines (default12) of a CalcJob's exact retrieved filename. Bounded to20000 raw bytes plus one sentinel; no writes or execution. Remaining content is omitted, never replaced with the tail. Total line count is unknown. Text is raw, not interpreted scientific units."""
+        if isinstance(head_lines, bool) or not isinstance(head_lines, int) or not 1 <= head_lines <= 100:
+            raise ToolError("head_lines must be an integer between1 and100")
+        if not isinstance(filename, str) or not filename or "/" in filename or "\\" in filename or filename in (".", ".."):
+            raise ToolError("filename must be an exact retrieved-file basename from list_retrieved_files")
+        try:
+            node, retrieved = _retrieved_folder(identifier)
+            objects = {item.name: item for item in retrieved.base.repository.list_objects()}
+            if filename not in objects or not objects[filename].is_file():
+                raise ToolError("filename is not an exact retrieved file; consult list_retrieved_files")
+            with retrieved.base.repository.open(filename, mode="rb") as stream:
+                result = _read_head(stream, head_lines)
+            return {"pk": node.pk, "filename": filename, **result}
+        except (NotExistent, FileNotFoundError) as exc:
+            raise ToolError("CalcJob or retrieved file is unavailable") from exc
+
+
+    def register(mcp):
+        from aiida_agents.mcp.tools import to_mcp_tool_error
+        mcp.tool(to_mcp_tool_error(get_retrieved_file_head))
+
+
+  workspace_fs.py: |
+    """Agent file tools for the AiiDAlab workspace: everything under notebooks/.
+
+    Every call goes through the Jupyter contents API, the same authority the
+    AiiDAlab file browser uses, so what an agent changes is what a human sees. The
+    Jupyter root is the whole home directory; this module exposes only the
+    notebooks/ subtree, so .aiida, credentials and the mounted tools are not
+    reachable from here.
+
+    Paths are relative to notebooks/ and may name subdirectories. No tool
+    overwrites an existing target. Notebook links come back as /lab/tree/ URLs.
+
+    Jupyter runs with allow_hidden false (the jupyter_server default, unset in this
+    image), so it refuses any dot-directory: the trash therefore lives in
+    notebooks/trash/, not notebooks/.trash/. A permanent delete removes the entry
+    from the workspace; jupyter_server's own delete_to_trash may still keep a copy
+    in the Jupyter user's XDG trash, which is outside notebooks/ and not reachable
+    from these tools.
+    """
+
+    import posixpath
+    import time
+    from urllib.parse import quote
+
+    NOTEBOOK_DIR = "notebooks"
+    # Visible on purpose: jupyter_server refuses hidden paths, so a dot-trash could
+    # not be created, moved into or deleted through the contents API.
+    TRASH_ROOT = "trash"
+    MAX_DEPTH = 16
+
+    _callbacks = {}
+
+
+    def register(mcp, *, jupyter, notebook_dir, public_url):
+        """Wire these tools to the server's Jupyter bridge, workspace root and URL builder."""
+        from aiida_agents.mcp.tools import to_mcp_tool_error
+
+        _callbacks.update(jupyter=jupyter, notebook_dir=notebook_dir, public_url=public_url)
+        for tool in (workspace_stat, workspace_mkdir, workspace_move, workspace_copy, workspace_delete):
+            mcp.tool()(to_mcp_tool_error(tool))
+
+
+    def _jupyter(method, endpoint, **kwargs):
+        return _callbacks["jupyter"](method, endpoint, **kwargs)
+
+
+    def _notebook_dir():
+        return _callbacks.get("notebook_dir") or NOTEBOOK_DIR
+
+
+    def _rel(path, label, *, allow_root=False):
+        """Return a caller path relative to notebooks/, or refuse it.
+
+        Absolute paths, '..' segments, NUL and other control characters, and
+        backslashes are refused, so no accepted path can name anything outside
+        notebooks/. Normalization drops '.' and empty segments; it never resolves a
+        parent segment.
+        """
+        if not isinstance(path, str):
+            raise ValueError("%s must be a string" % label)
+        if path.startswith("/"):
+            raise ValueError("%s is relative to %s/, not absolute: %r"
+                             % (label, _notebook_dir(), path))
+        if "\\" in path:
+            raise ValueError("%s must use '/' as its only separator: %r" % (label, path))
+        if any(ord(char) < 32 for char in path):
+            raise ValueError("%s must not contain NUL or other control characters" % label)
+        if ".." in path.split("/"):
+            raise ValueError("%s must not contain '..': %r" % (label, path))
+        rel = posixpath.normpath(path)
+        if rel == ".":
+            rel = ""
+        if not rel:
+            if allow_root:
+                return ""
+            raise ValueError("%s must name something inside %s/" % (label, _notebook_dir()))
+        if rel.split("/")[0] == _notebook_dir():
+            raise ValueError("%s is already relative to %s/, drop the %r prefix: %r"
+                             % (label, _notebook_dir(), _notebook_dir(), path))
+        return rel
+
+
+    def _rooted(rel):
+        return _notebook_dir() + "/" + rel if rel else _notebook_dir()
+
+
+    def _escape(path):
+        return "/".join(quote(part, safe="") for part in path.split("/"))
+
+
+    def _endpoint(rel):
+        return "/api/contents/" + _escape(_rooted(rel))
+
+
+    def _url(rel):
+        return _callbacks["public_url"]("/lab/tree/" + _escape(_rooted(rel)))
+
+
+    def _entry(rel, model):
+        return {"path": rel, "type": model.get("type"), "size": model.get("size"),
+                "mtime": model.get("last_modified"), "url": _url(rel)}
+
+
+    def _stat(rel):
+        """Model for one entry; a 404 becomes 'not found', other failures pass through."""
+        try:
+            return _jupyter("GET", _endpoint(rel), params={"content": 0})
+        except RuntimeError as error:
+            if "-> 404:" in str(error):
+                raise ValueError("not found in the workspace: %r" % (rel or ".")) from error
+            raise
+
+
+    def _exists(rel):
+        try:
+            _stat(rel)
+        except ValueError:
+            return False
+        return True
+
+
+    def _require_absent(rel):
+        if _exists(rel):
+            raise ValueError("target already exists and nothing here overwrites: %r" % rel)
+
+
+    def _require_not_inside(source, destination):
+        # Reading the children of a directory that contains its own copy would
+        # recurse into the copy being written.
+        if destination.startswith(source + "/"):
+            raise ValueError("target must not be inside the source: %r" % destination)
+
+
+    def _ensure_root():
+        # A directory save on an existing directory is logged and accepted, so this
+        # is idempotent; a fresh profile has no notebooks/ yet.
+        _jupyter("PUT", _endpoint(""), json={"type": "directory"})
+
+
+    def _ensure_dir(rel):
+        """Create rel and its missing parents, one level per save; returns what was created.
+
+        Jupyter saves a directory with a single mkdir, so a missing parent fails
+        there and has to be created first, outermost first.
+        """
+        created = []
+        parts = rel.split("/") if rel else []
+        for index in range(1, len(parts) + 1):
+            prefix = "/".join(parts[:index])
+            if not _exists(prefix):
+                _jupyter("PUT", _endpoint(prefix), json={"type": "directory"})
+                created.append(prefix)
+        return created
+
+
+    def _children(rel):
+        listing = _jupyter("GET", _endpoint(rel), params={"content": 1})
+        children = listing.get("content")
+        if not isinstance(children, list):
+            raise RuntimeError("Jupyter returned no directory listing for %r" % rel)
+        return children
+
+
+    def _child_entry(rel, child):
+        name = child.get("name")
+        return {"name": name, "path": rel + "/" + str(name) if rel else str(name),
+                "type": child.get("type"), "size": child.get("size"),
+                "mtime": child.get("last_modified")}
+
+
+    def workspace_stat(path: str = "") -> dict:
+        """Describe one file, notebook or directory in the workspace. path is relative to notebooks/ ("" is the workspace root) and may be nested, e.g. 819-files/aiida.out. A directory result also carries its children, so this is the tree listing: name, path, type, size and mtime per child. Read-only."""
+        rel = _rel(path, "path", allow_root=True)
+        model = _stat(rel)
+        result = _entry(rel, model)
+        if model.get("type") == "directory":
+            result["entries"] = [_child_entry(rel, child) for child in _children(rel)]
+        return result
+
+
+    def workspace_mkdir(path: str) -> dict:
+        """Create a directory in the workspace, with missing parents. path is relative to notebooks/, e.g. runs/2026-10. Refuses a path that already exists; returns the new directory and the paths created."""
+        rel = _rel(path, "path")
+        _require_absent(rel)
+        _ensure_root()
+        created = _ensure_dir(posixpath.dirname(rel))
+        _jupyter("PUT", _endpoint(rel), json={"type": "directory"})
+        created.append(rel)
+        result = _entry(rel, _stat(rel))
+        result["created"] = created
+        return result
+
+
+    def workspace_move(path: str, target: str) -> dict:
+        """Rename or move one entry inside the workspace (a rename, not a copy). Both paths are relative to notebooks/; target parents are created. Refuses an existing target; use workspace_copy to duplicate instead."""
+        source = _rel(path, "path")
+        destination = _rel(target, "target")
+        model = _stat(source)
+        _require_absent(destination)
+        _require_not_inside(source, destination)
+        _ensure_root()
+        _ensure_dir(posixpath.dirname(destination))
+        moved = _jupyter("PATCH", _endpoint(source), json={"path": _rooted(destination)})
+        return {"source": _entry(source, model), "target": _entry(destination, moved)}
+
+
+    def workspace_copy(path: str, target: str) -> dict:
+        """Copy a file, notebook or whole directory inside the workspace. Both paths are relative to notebooks/; target parents are created. Refuses an existing target. Content is read and written per entry, so a directory is recreated recursively; returns files and bytes copied."""
+        source = _rel(path, "path")
+        destination = _rel(target, "target")
+        model = _stat(source)
+        _require_absent(destination)
+        _require_not_inside(source, destination)
+        _ensure_root()
+        counts = {"files": 0, "bytes": 0}
+        _copy_entry(source, destination, model, counts, 0)
+        return {"source": _entry(source, model),
+                "target": _entry(destination, _stat(destination)),
+                "copied": counts}
+
+
+    def _copy_entry(source, destination, model, counts, depth):
+        if model.get("type") == "directory":
+            if depth >= MAX_DEPTH:
+                raise ValueError("directory nesting is deeper than %d levels at %r" % (MAX_DEPTH, source))
+            children = _children(source)
+            _ensure_dir(destination)
+            for child in children:
+                name = child.get("name")
+                if not isinstance(name, str) or not name or "/" in name:
+                    raise RuntimeError("Jupyter returned an unusable directory entry under %r" % source)
+                _copy_entry(source + "/" + name, destination + "/" + name, child, counts, depth + 1)
+            return
+        payload = _jupyter("GET", _endpoint(source), params={"content": 1})
+        if payload.get("type") == "notebook":
+            body = {"type": "notebook", "format": "json", "content": payload.get("content")}
+        else:
+            body = {"type": "file", "format": payload.get("format") or "text",
+                    "content": payload.get("content")}
+        _jupyter("PUT", _endpoint(destination), json=body)
+        counts["files"] += 1
+        counts["bytes"] += int(model.get("size") or 0)
+
+
+    def workspace_delete(path: str, trash: bool = True, confirm: bool = False) -> dict:
+        """Delete one entry in the workspace. trash=true (default) moves it to notebooks/trash/<UTC timestamp>/<name>, so it can be restored from the file browser. trash=false removes it from the workspace and is refused unless confirm=true as well. Returns what was moved or removed."""
+        for value, label in ((trash, "trash"), (confirm, "confirm")):
+            if type(value) is not bool:
+                raise ValueError("%s must be true or false" % label)
+        if not trash and not confirm:
+            raise ValueError("trash=false deletes permanently; pass confirm=true as well")
+        rel = _rel(path, "path")
+        model = _stat(rel)
+        if not trash:
+            _jupyter("DELETE", _endpoint(rel))
+            return {"deleted": _entry(rel, model), "trash": False, "target": None}
+        destination = _trash_target(rel)
+        _ensure_root()
+        _ensure_dir(posixpath.dirname(destination))
+        moved = _jupyter("PATCH", _endpoint(rel), json={"path": _rooted(destination)})
+        return {"deleted": _entry(rel, model), "trash": True,
+                "target": _entry(destination, moved)}
+
+
+    def _trash_target(rel):
+        """A free path under notebooks/trash/<UTC timestamp>/ for the basename of rel."""
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        name = posixpath.basename(rel)
+        destination = "%s/%s/%s" % (TRASH_ROOT, stamp, name)
+        suffix = 1
+        while _exists(destination):
+            suffix += 1
+            destination = "%s/%s/%s-%d" % (TRASH_ROOT, stamp, name, suffix)
+        return destination
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: aiida-mcp
+  namespace: aiidalab
+  labels:
+    app: aiida-mcp
+spec:
+  selector:
+    app: aiida-mcp
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aiida-mcp
+  namespace: aiidalab
+  labels:
+    app: aiida-mcp
+spec:
+  replicas: 1
+  # RollingUpdate so a roll is always-hot: the new pod joins the endpoints before
+  # the old one drops. Recreate left a refusal window on every roll, which is what
+  # the probe saw as transient 401/500 during earlier redeploys. maxUnavailable 0
+  # also means a broken image never takes the service down: the old keeps serving.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: aiida-mcp
+  template:
+    metadata:
+      labels:
+        app: aiida-mcp
+      annotations:
+        # Roll the pod when the ConfigMap content changes; Kubernetes does not
+        # restart consumers on its own.
+        # Rendered at build time from the ConfigMap data in this file (see
+        # services/nixos/aiidalab-openclaw-demo/render-manifests.py). Never hardcode it.
+        checksum/code: "@MCP_CODE_CHECKSUM@"
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 0
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: mcp-proxy
+          image: sandbox.local/aiidalab:26.10.0
+          imagePullPolicy: IfNotPresent
+          # No SLURM ssh key is staged or mounted here: submission is the
+          # daemon's job, and this pod must not hold a credential that can
+          # reach the Slurm controller.
+          command:
+            - /opt/venvs/agents/bin/python
+            - /opt/mcp/front.py
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            readOnlyRootFilesystem: true
+          env:
+            - name: HOME
+              value: /home/aiida
+            # sitecustomize here flips aiida-core's import_sys_environment default,
+            # which rootless slurmd cannot honour.
+            # The lab venv supplies aiida-quantumespresso; this venv does not have
+            # it. An init container copies just those packages into /plugins, and
+            # /plugins is on PYTHONPATH because every tool runs its work in a child
+            # interpreter, which only sees PYTHONPATH, not runtime sys.path edits.
+            # Never point this at the whole lab site-packages: cachetools resolves
+            # from there, and fastmcp then dies with "MemoryStore requires
+            # py-key-value-aio[memory]" and the server never starts.
+            - name: PYTHONPATH
+              value: /plugins:/opt/aiida-override
+            # Notebook tools go through the Jupyter server's contents API, so the
+            # files are created by Jupyter itself and appear in the AiiDAlab browser.
+            - name: JUPYTER_URL
+              value: http://aiidalab:8888
+            # Absolute base for the link the agent posts. The tool returns it
+            # already joined, so a model never has to build a URL itself.
+            - name: JUPYTER_PUBLIC_URL
+              value: https://@AIIDA_HOSTNAME@
+            - name: JUPYTER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: aiidalab-jupyter
+                  key: JUPYTER_TOKEN
+            - name: AIIDA_MCP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: aiida-mcp
+                  key: token
+          ports:
+            - name: http
+              containerPort: 8080
+          # An authenticated initialize, not a TCP check: a dead mcp-proxy child
+          # kept the pod at 1/1 Running while every call answered 500 with
+          # "ConnectError" to 127.0.0.1:8081. This is the regression that hid it.
+          readinessProbe:
+            exec:
+              command:
+                - /opt/venvs/agents/bin/python
+                - -c
+                - |
+                  import os, sys, httpx
+                  body = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                          "params": {"protocolVersion": "2025-03-26", "capabilities": {},
+                                     "clientInfo": {"name": "readiness", "version": "0"}}}
+                  headers = {"Authorization": "Bearer " + os.environ["AIIDA_MCP_TOKEN"],
+                             "Accept": "application/json, text/event-stream"}
+                  try:
+                      response = httpx.post("http://127.0.0.1:8080/mcp", json=body,
+                                            headers=headers, timeout=5)
+                  except Exception:
+                      sys.exit(1)
+                  if response.status_code != 200 or not response.headers.get("mcp-session-id"):
+                      sys.exit(1)
+                  session = response.headers["mcp-session-id"]
+                  try:
+                      httpx.delete("http://127.0.0.1:8080/mcp", headers={**headers, "Mcp-Session-Id": session}, timeout=2)
+                  except Exception:
+                      pass
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 8
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 250m
+              memory: 1Gi
+            limits:
+              cpu: "4"
+              memory: 8Gi
+          volumeMounts:
+            # filer's exporter, mounted inside the PVC without shadowing it.
+            - name: aiida-tools
+              mountPath: /home/aiida/aiida-tools
+              readOnly: true
+            - name: plugins
+              mountPath: /plugins
+              readOnly: true
+            - name: code
+              mountPath: /opt/mcp
+              readOnly: true
+            - name: home
+              mountPath: /home/aiida
+            - name: slurm-override
+              mountPath: /opt/aiida-override
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      initContainers:
+        # aiida-quantumespresso lives only in the lab venv. Copy the two packages
+        # it needs so the agents venv can see its entry points without taking the
+        # whole lab site-packages onto its path.
+        - name: plugins
+          image: sandbox.local/aiidalab:26.10.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - bash
+            - -c
+            - |
+              set -eu
+              lab=/opt/venvs/lab/lib/python3.12/site-packages
+              cp -a "$lab"/aiida_quantumespresso "$lab"/aiida_quantumespresso-*.dist-info \
+                    "$lab"/qe_tools "$lab"/qe_tools-*.dist-info /plugins/
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: plugins
+              mountPath: /plugins
+      volumes:
+        - name: aiida-tools
+          configMap:
+            name: aiida-tools
+        - name: plugins
+          emptyDir: {}
+        - name: code
+          configMap:
+            name: aiida-mcp-code
+        - name: home
+          persistentVolumeClaim:
+            claimName: aiidalab-home
+        - name: slurm-override
+          configMap:
+            name: aiida-slurm-override
+        - name: tmp
+          emptyDir: {}

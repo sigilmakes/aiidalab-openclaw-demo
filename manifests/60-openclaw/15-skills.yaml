@@ -1,0 +1,76 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: openclaw-skills
+  namespace: openclaw
+  labels:
+    app.kubernetes.io/name: openclaw
+    app.kubernetes.io/part-of: aiidalab-openclaw-demo
+data:
+  # One file per key; the volume projects it as aiida-notebook/SKILL.md.
+  aiida-notebook-SKILL.md: |
+    ---
+    name: aiida-notebook
+    description: Write a reproducible Jupyter notebook for every AiiDA process you submit, so the human can open and rerun it in AiiDAlab. Use when submitting a calculation, or when asked what you have written.
+    ---
+
+    # AiiDA notebooks
+
+    When you submit an AiiDA process with `aiida__submit_process_spec`, also write a
+    notebook that reproduces the submission.
+
+    - Tool: `aiida__write_notebook(path, cells, title="")`. `path` is a **bare
+      filename**, not a path. Slashes, dot-segments and a leading dot are rejected
+      on purpose, and `.ipynb` is added for you.
+    - Name it `<pk>-<label>`, where `<pk>` is the process pk returned by the
+      submit and `<label>` is a short lower-case hyphenated description. Example:
+      `250-silicon-lda`. One notebook per submission; if that name is taken,
+      append `-2`. Never start the name with a dot and never put `..` in it: the
+      tool refuses hidden names and traversal.
+    - `cells` is a list of `{"type": "markdown"|"code", "source": "..."}`. The first
+      cell is markdown and names the process, the pk and the time. The rest must run
+      top to bottom: load the AiiDA profile, rebuild the same inputs, submit, print
+      the pk. Rebuild inputs from the payload you passed to
+      `aiida__submit_process_spec`.
+    - The tool returns `path` (`notebooks/<name>.ipynb`), `cells`, `size`,
+      `in_aiidalab` and usually `url`. NOTEBOOKS ARE SERVER-GUARANTEED:
+      `aiida__submit_process_spec` auto-writes the repro notebook and returns its
+      absolute `url` in the same reply. Recover by hand ONLY when the submit result
+      carries the `repro_notebook_required` error kind: call
+      `aiida__write_notebook(path, cells, title)` with the same naming rule
+      (<pk>-<label>, `-2` on collision). After a submit your job is: read the `url`,
+      report it, poll with `wait_for_process`, fetch evidence with
+      `get_retrieved_file(identifier, filename="aiida.out")`.
+    - Give the human the full link: the `url` field verbatim (absolute, nothing to
+      concatenate; never a relative path or a bare `/lab/tree/...`), otherwise
+      `https://@AIIDA_HOSTNAME@` + `in_aiidalab`. Example:
+      Example target: https://@AIIDA_HOSTNAME@/lab/tree/notebooks/<pk>-<label>.ipynb
+    - Notebook cells are PYTHON: write `True`/`False`, never JavaScript's
+      `true`/`false`, and validate every generated cell runs before handing over
+      the link. A cell that dies with NameError 'true' is worse than no notebook.
+    - In CHAT, a notebook link is a markdown link whose target is the absolute
+      URL: [open 355-si2.ipynb](https://@AIIDA_HOSTNAME@/lab/tree/notebooks/355-si2.ipynb).
+      Never wrap a notebook URL in backticks or code style: the control UI only turns
+      github.com code spans into links, so any other URL stays a non-clickable code
+      chip. Never emit a file chip or a bare lab/tree/... path: chips are inert, and a
+      relative markdown target anchors against https://@CLAW_HOSTNAME@ and re-opens
+      the OpenClaw shell on a dead route. A bare URL in plain prose is acceptable. If
+      the deployment is behind Cloudflare Access and the user needs to sign in again:
+      open https://@AIIDA_HOSTNAME@ in one browser tab, complete the Access sign-in
+      once, KEEP THAT TAB OPEN, then open notebook links in new tabs of the same
+      browser. Never rely on in-chat link previews: they fetch without the user's
+      Access cookie and render the sign-in wall, not the notebook.
+    - If the deployment is behind Cloudflare Access, the first AiiDAlab page asks for
+      the Jupyter token. Paste it once (read it from the cluster Secret; never paste
+      the value into chat) and Jupyter keeps the cookie.
+    - Only name AiiDA tools that are in your current tool catalog. Describe what
+      a tool does only after `tool_search` or `tool_describe` confirmed it
+      exists; if it is missing, say it is unavailable rather than inventing its
+      behaviour.
+    - Use `aiida__list_workspace()` to confirm the file exists and to answer "what
+      have you written?". It returns entries with name, size and mtime.
+    - No credentials, tokens or host paths inside the notebook.
+
+    Never submit a process without also writing its notebook. If the write fails,
+    say so plainly and paste the notebook cells in the reply instead of describing
+    a notebook you did not write.

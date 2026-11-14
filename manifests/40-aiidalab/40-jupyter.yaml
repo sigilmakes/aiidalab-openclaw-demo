@@ -1,0 +1,118 @@
+# JupyterLab with AiiDA. Contract: ClusterIP `aiidalab` port 8888, consumed by edge.
+apiVersion: v1
+kind: Service
+metadata:
+  name: aiidalab
+  namespace: aiidalab
+  labels:
+    app: aiidalab-jupyter
+spec:
+  selector:
+    app: aiidalab-jupyter
+  ports:
+    - name: http
+      port: 8888
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aiidalab-jupyter
+  namespace: aiidalab
+  labels:
+    app: aiidalab-jupyter
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: aiidalab-jupyter
+  template:
+    metadata:
+      labels:
+        app: aiidalab-jupyter
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 0
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: jupyter
+          image: sandbox.local/aiidalab:26.10.0
+          # IfNotPresent: the image is imported into the node's containerd store
+          # (the registry is not reachable from the node, and its netpol is gone),
+          # so a pull policy of Always would leave the pod in ImagePullBackOff.
+          imagePullPolicy: IfNotPresent
+          command:
+            - /usr/local/bin/aiidalab-entry.sh
+            - jupyter
+            - lab
+            - --ip
+            - 0.0.0.0
+            - --port
+            - "8888"
+            - --no-browser
+            - --config
+            - /etc/jupyter/jupyter_server_config.py
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            readOnlyRootFilesystem: true
+          env:
+            - name: HOME
+              value: /home/aiida
+            - name: JUPYTER_TOKEN_FILE
+              value: /run/secrets/jupyter_token
+            # Keeps `verdi run` here from emitting '#SBATCH --get-user-env',
+            # which rootless slurmd refuses.
+            - name: PYTHONPATH
+              value: /opt/aiida-override
+          ports:
+            - name: http
+              containerPort: 8888
+          readinessProbe:
+            httpGet:
+              path: /login
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 1
+              memory: 4Gi
+            limits:
+              cpu: "16"
+              memory: 32Gi
+          volumeMounts:
+            - name: home
+              mountPath: /home/aiida
+            - name: jupyter-token
+              mountPath: /run/secrets
+              readOnly: true
+            - name: slurm-override
+              mountPath: /opt/aiida-override
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: home
+          persistentVolumeClaim:
+            claimName: aiidalab-home
+        - name: jupyter-token
+          secret:
+            secretName: aiidalab-jupyter
+            items:
+              - key: JUPYTER_TOKEN
+                path: jupyter_token
+            defaultMode: 0440
+        - name: slurm-override
+          configMap:
+            name: aiida-slurm-override
+        - name: tmp
+          emptyDir: {}

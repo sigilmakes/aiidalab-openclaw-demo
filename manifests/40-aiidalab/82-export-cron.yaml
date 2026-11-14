@@ -1,0 +1,101 @@
+# Artifact plane: export terminal CalcJobNodes to browsable <pk>-files/ trees.
+# Runs the exporter directly in a job pod -- same image, same uid, same home
+# PVC as aiida-daemon. No ServiceAccount, no RBAC, no pods/exec: the job has
+# no API access at all (exec would open a door on the pod that mounts the
+# SLURM controller key, and pods/exec cannot be name-scoped across rollouts).
+# State and locking are the checkpoint file itself: the exporter takes an
+# exclusive flock on checkpoint.json, so cron runs and the MCP on-demand tool
+# (same script, same file) cannot interleave.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: files-export
+  namespace: aiidalab
+  labels:
+    app.kubernetes.io/part-of: aiidalab
+spec:
+  schedule: "*/10 * * * *"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 300
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 600
+      backoffLimit: 1
+      ttlSecondsAfterFinished: 3600
+      template:
+        metadata:
+          labels:
+            app: files-export
+        spec:
+          automountServiceAccountToken: false
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 0
+            fsGroup: 1000
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: export
+              image: sandbox.local/aiidalab:26.10.0
+              imagePullPolicy: IfNotPresent
+              # Markers are written here, in this pod, from the exporter's exit
+              # status -- no second process, no cluster API call.
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -u
+                  export HOME=/home/aiida
+                  ledger="$HOME/.aiida-files-export"
+                  mkdir -p "$ledger"
+                  date -Iseconds > "$ledger/last-attempt.txt"
+                  /opt/venvs/lab/bin/python -W ignore::DeprecationWarning \
+                      /opt/aiida-tools/files_export.py --all-terminal --json \
+                      > "$ledger/last-run.log" 2>&1
+                  rc=$?
+                  if [ "$rc" -eq 0 ]; then
+                    date -Iseconds > "$ledger/last-success.txt"
+                  else
+                    date -Iseconds > "$ledger/last-failure.txt"
+                  fi
+                  tail -n 5 "$ledger/last-run.log"
+                  exit "$rc"
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: [ALL]
+                readOnlyRootFilesystem: true
+              env:
+                - name: HOME
+                  value: /home/aiida
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 512Mi
+                limits:
+                  cpu: "1"
+                  memory: 2Gi
+              volumeMounts:
+                - name: home
+                  mountPath: /home/aiida
+                - name: tools
+                  mountPath: /opt/aiida-tools
+                  readOnly: true
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: home
+              persistentVolumeClaim:
+                claimName: aiidalab-home
+            # One declarative copy of the exporter; the unit renders it from
+            # services/nixos/aiidalab-openclaw-demo/scripts/files_export.py.
+            - name: tools
+              configMap:
+                name: aiida-tools
+                defaultMode: 0444
+            - name: tmp
+              emptyDir: {}

@@ -1,0 +1,43 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+    name: cloudflared-ingress-demo
+    namespace: edge
+data:
+    config.yml: |
+        # Open routes for the demo window. This ConfigMap is data only: the
+        # Deployment mounts cloudflared-ingress. Copy this config into that
+        # live switch, restart the connector, and revert when the window ends.
+        tunnel: @TUNNEL_ID@
+        credentials-file: /etc/cloudflared/creds/credentials.json
+        ingress:
+            - hostname: @CLAW_HOSTNAME@
+              service: http://openclaw.openclaw.svc.cluster.local:18789
+              originRequest:
+                access:
+                    required: true
+                    teamName: @ACCESS_TEAM@
+                    audTag:
+                        - @ACCESS_AUD_CLAW@
+            - hostname: @AIIDA_HOSTNAME@
+              service: http://aiidalab.aiidalab.svc.cluster.local:8888
+              originRequest:
+                access:
+                    required: true
+                    teamName: @ACCESS_TEAM@
+                    audTag:
+                        - @ACCESS_AUD_AIIDA@
+            # Portals: one wildcard hostname, one port. The gateway serves every
+            # portal from its own ingress listener, so a single route covers
+            # <name>.<portal domain>. Keep the portal one label below a zone
+            # apex: Universal SSL covers the apex and one wildcard level only,
+            # and a two-label name reaches the edge without a certificate.
+            - hostname: "*.@PORTAL_DOMAIN@"
+              service: http://openclaw.openclaw.svc.cluster.local:18790
+              originRequest:
+                access:
+                    required: true
+                    teamName: @ACCESS_TEAM@
+                    audTag:
+                        - @ACCESS_AUD_PORTAL@
+            - service: http_status:404

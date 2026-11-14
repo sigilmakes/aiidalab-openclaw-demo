@@ -1,0 +1,35 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: openclaw-state
+  namespace: openclaw
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: @STORAGE_CLASS@
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: openclaw-nix
+  namespace: openclaw
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: @STORAGE_CLASS@
+  resources:
+    requests:
+      storage: 64Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: bifrost-state
+  namespace: bifrost
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: @STORAGE_CLASS@
+  resources:
+    requests:
+      storage: 5Gi

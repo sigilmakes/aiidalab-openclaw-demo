@@ -1,0 +1,42 @@
+# AiiDA emits `#SBATCH --get-user-env` whenever metadata.options.import_sys_environment
+# is true, which is aiida-core's default. slurmd here runs rootless (SlurmdUser=aiida)
+# and Slurm refuses that directive unless slurmd is root, so the job is cancelled at
+# launch and the calcjob ends in exit 305 with an empty retrieve. The MCP server
+# already forces the option false for its callers; this keeps `verdi run` and
+# hand-written submit scripts on the same footing, because a user who does not know
+# about the constraint should not be able to lose an hour to it.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: aiida-slurm-override
+  namespace: aiidalab
+  labels:
+    app: aiida-slurm-override
+data:
+  sitecustomize.py: |
+    """Profile-wide defaults for this rootless-slurmd sandbox."""
+    import os as _os
+    import sys as _sys
+
+    # The lab venv carries packages the agents venv does not (pymatgen, qe_tools),
+    # and aiida-quantumespresso imports pymatgen at module scope. Appending at the
+    # END keeps every module that is already installed resolving from the venv
+    # that started the interpreter: putting this path first made fastmcp pick up
+    # lab's cachetools and fail to import.
+    _fallback = "/opt/venvs/lab/lib/python3.12/site-packages"
+    if _os.path.isdir(_fallback) and _fallback not in _sys.path:
+        _sys.path.append(_fallback)
+
+    try:
+        from aiida.schedulers.plugins import slurm
+
+        _original = slurm.SlurmScheduler._get_submit_script_header
+
+        def _header_without_get_user_env(self, job_tmpl):
+            job_tmpl.import_sys_environment = False
+            return _original(self, job_tmpl)
+
+        _header_without_get_user_env.__doc__ = _original.__doc__
+        slurm.SlurmScheduler._get_submit_script_header = _header_without_get_user_env
+    except Exception:  # aiida absent, older plugin layout: leave the interpreter alone
+        pass

@@ -1,0 +1,121 @@
+# Allow-list policies layered on top of the namespace default-deny
+# (manifests/10-network-policy.yaml). Never allow egress to RFC1918,
+# link-local, loopback, or metadata addresses.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+    name: bifrost-allow-ingress
+    namespace: bifrost
+spec:
+    podSelector:
+        matchLabels:
+            app.kubernetes.io/name: bifrost
+    policyTypes: [Ingress]
+    ingress:
+        # OpenClaw is the only cross-namespace consumer of the gateway.
+        - from:
+              - namespaceSelector:
+                    matchLabels:
+                        kubernetes.io/metadata.name: openclaw
+          ports:
+              - protocol: TCP
+                port: 8080
+        # Same-namespace traffic: the manual bifrost-selftest job.
+        - from:
+              - podSelector: {}
+          ports:
+              - protocol: TCP
+                port: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+    name: bifrost-allow-egress
+    namespace: bifrost
+spec:
+    podSelector:
+        matchLabels:
+            app.kubernetes.io/name: bifrost
+    policyTypes: [Egress]
+    egress:
+        # Cluster DNS only (k3s coredns).
+        - to:
+              - namespaceSelector:
+                    matchLabels:
+                        kubernetes.io/metadata.name: kube-system
+                podSelector:
+                    matchLabels:
+                        k8s-app: kube-dns
+          ports:
+              - protocol: UDP
+                port: 53
+              - protocol: TCP
+                port: 53
+        # Internet HTTPS, private ranges excluded (incl. 10.0.0.0/8 which covers
+        # pod/service/node addresses on this cluster, and the metadata endpoint).
+        - to:
+              - ipBlock:
+                    cidr: 0.0.0.0/0
+                    except:
+                        - 10.0.0.0/8
+                        - 172.16.0.0/12
+                        - 192.168.0.0/16
+                        - 169.254.0.0/16
+                        - 127.0.0.0/8
+          ports:
+              - protocol: TCP
+                port: 443
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+    name: bifrost-selftest-egress
+    namespace: bifrost
+spec:
+    podSelector:
+        matchLabels:
+            app.kubernetes.io/name: bifrost-selftest
+    policyTypes: [Egress]
+    egress:
+        - to:
+              - namespaceSelector:
+                    matchLabels:
+                        kubernetes.io/metadata.name: kube-system
+                podSelector:
+                    matchLabels:
+                        k8s-app: kube-dns
+          ports:
+              - protocol: UDP
+                port: 53
+              - protocol: TCP
+                port: 53
+        - to:
+              - podSelector:
+                    matchLabels:
+                        app.kubernetes.io/name: bifrost
+          ports:
+              - protocol: TCP
+                port: 8080
+---
+# Object in the openclaw namespace so the gateway is actually reachable from
+# its one consumer. Owned here (50-bifrost); drop if the openclaw or edge
+# directories ship their own version of this allow.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+    name: openclaw-to-bifrost-egress
+    namespace: openclaw
+spec:
+    podSelector: {}
+    policyTypes: [Egress]
+    egress:
+        - to:
+              - namespaceSelector:
+                    matchLabels:
+                        kubernetes.io/metadata.name: bifrost
+                podSelector:
+                    matchLabels:
+                        app.kubernetes.io/name: bifrost
+          ports:
+              - protocol: TCP
+                port: 8080

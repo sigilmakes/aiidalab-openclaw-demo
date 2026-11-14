@@ -1,0 +1,92 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: aiidalab-postgres
+  namespace: aiidalab
+  labels:
+    app: aiidalab-postgres
+spec:
+  selector:
+    app: aiidalab-postgres
+  ports:
+    - name: pg
+      port: 5432
+      targetPort: pg
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: aiidalab-postgres
+  namespace: aiidalab
+  labels:
+    app: aiidalab-postgres
+spec:
+  serviceName: aiidalab-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: aiidalab-postgres
+  template:
+    metadata:
+      labels:
+        app: aiidalab-postgres
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: postgres
+          image: postgres:17.6
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            readOnlyRootFilesystem: true
+          env:
+            - name: POSTGRES_USER
+              value: aiida
+            - name: POSTGRES_DB
+              value: aiidadb
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: aiidalab-db
+                  key: POSTGRES_PASSWORD
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - name: pg
+              containerPort: 5432
+          readinessProbe:
+            exec:
+              command: [pg_isready, -U, aiida, -d, aiidadb]
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "8"
+              memory: 16Gi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: pgsock
+              mountPath: /var/run/postgresql
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: aiidalab-postgres
+        - name: pgsock
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}

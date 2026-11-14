@@ -1,0 +1,123 @@
+# One-shot, idempotent bootstrap job for the AiiDA profile, the in-cluster
+# SLURM computer, one code per Quantum ESPRESSO executable and the SSSP
+# pseudopotential family.
+# The script is rendered from images/aiidalab/bootstrap.sh into the
+# aiidalab-bootstrap ConfigMap and mounted over the image copy. The Job name
+# carries a short digest of that script, so changing the registration logic
+# creates a new Job instead of trying to mutate an immutable one.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: aiidalab-bootstrap-@BOOTSTRAP_HASH@
+  namespace: aiidalab
+  labels:
+    app: aiidalab-bootstrap
+spec:
+  backoffLimit: 8
+  # Short-lived: this Job is applied again on every activation, and its log used
+  # to contain the RabbitMQ password printed by `verdi profile setup`.
+  ttlSecondsAfterFinished: 900
+  template:
+    metadata:
+      labels:
+        app: aiidalab-bootstrap
+    spec:
+      automountServiceAccountToken: false
+      restartPolicy: OnFailure
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 0
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: bootstrap
+          image: sandbox.local/aiidalab:26.10.0
+          imagePullPolicy: IfNotPresent
+          # AiiDA prints the profile configuration, broker password included, on
+          # stdout. Mask that one value and nothing else: "password
+          # authentication failed" must stay readable in this log.
+          command:
+            - bash
+            - -c
+            - |
+              set -o pipefail
+              /opt/aiidalab/bootstrap.sh 2>&1 | sed -e "s|$AIIDA_RABBITMQ_PASSWORD|[redacted]|g"
+              rc=${PIPESTATUS[0]}
+              [ "$rc" -eq 0 ] || exit "$rc"
+              # bootstrap.sh stages the key into $HOME and points the transport at
+              # it. Undo both: the daemon mounts the secret itself at /etc/slurm-key.
+              # safe_interval must be 0: the transport queue sleeps that many
+              # seconds before *every* transport request, so the 20 s that
+              # bootstrap.sh sets cost ~40 s between submit() and sbatch (upload
+              # plus submit). The target is an in-cluster sshd with no limit.
+              /opt/venvs/lab/bin/verdi -p aiidalab computer configure core.ssh \
+                --non-interactive --safe-interval 0 \
+                --key-filename /etc/slurm-key/id_ed25519 slurm-local
+              rm -f "$HOME/.ssh/id_ed25519"
+              exit 0
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            readOnlyRootFilesystem: true
+          env:
+            - name: HOME
+              value: /home/aiida
+            - name: AIIDA_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: aiidalab-db
+                  key: POSTGRES_PASSWORD
+            - name: AIIDA_RABBITMQ_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: aiidalab-rabbitmq
+                  key: RABBITMQ_PASSWORD
+            - name: AIIDA_DB_HOST
+              value: aiidalab-postgres
+            - name: AIIDA_RABBITMQ_HOST
+              value: aiidalab-rabbitmq
+          resources:
+            requests:
+              cpu: 500m
+              memory: 2Gi
+            limits:
+              cpu: "8"
+              memory: 16Gi
+          volumeMounts:
+            - name: home
+              mountPath: /home/aiida
+            - name: slurm-key
+              mountPath: /run/secrets
+              readOnly: true
+            # Also at the path the daemon uses. The job reconfigure it below: the
+            # shared PVC must not hold a Slurm-controller credential that the
+            # Jupyter and MCP pods can read.
+            - name: slurm-key
+              mountPath: /etc/slurm-key
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            - name: bootstrap-script
+              mountPath: /opt/aiidalab/bootstrap.sh
+              subPath: bootstrap.sh
+              readOnly: true
+      volumes:
+        - name: home
+          persistentVolumeClaim:
+            claimName: aiidalab-home
+        - name: slurm-key
+          secret:
+            secretName: aiidalab-slurm
+            items:
+              - key: id_ed25519
+                path: id_ed25519
+            defaultMode: 0440
+        - name: tmp
+          emptyDir: {}
+        - name: bootstrap-script
+          configMap:
+            name: aiidalab-bootstrap
+            defaultMode: 0555

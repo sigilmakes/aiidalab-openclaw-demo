@@ -1,0 +1,601 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: openclaw-config
+  namespace: openclaw
+  labels:
+    app.kubernetes.io/name: openclaw
+    app.kubernetes.io/component: gateway
+    app.kubernetes.io/part-of: aiidalab-openclaw-demo
+data:
+  # openclaw.json is the single source of truth for the gateway. Secrets are
+  # SecretRefs resolved from the container environment (BIFROST_VK,
+  # OPENCLAW_GATEWAY_PASSWORD, AIIDA_MCP_TOKEN); nothing secret is stored here.
+  #
+  # Model catalogue: every id below answered a live completion through Bifrost
+  # (2026-10-29). The five ids the project does not enable are absent.
+  #
+  # browser.ssrfPolicy.allowedHostnames is the navigation allowlist. Public
+  # hostnames outside it are refused while browser DNS pinning is unavailable;
+  # add a host here rather than turning the SSRF policy off.
+  openclaw.json: |
+    {
+      "agents": {
+        "ownership": "explicit",
+        "defaults": {
+          "workspace": "/srv/openclaw/workspace",
+          "model": {
+            "primary": "bifrost/claude-sonnet-5-5",
+            "fallbacks": [
+              "bifrost/claude-opus-5",
+              "bifrost/claude-sonnet-5"
+            ]
+          },
+          "utilityModel": "bifrost/claude-haiku-4-5",
+          "thinkingDefault": "low",
+          "sandbox": {
+            "mode": "off"
+          },
+          "heartbeat": {
+            "every": "0m",
+            "agentId": "main"
+          },
+          "systemAgent": {
+            "agentId": "main"
+          }
+        },
+        "entries": {
+          "main": {
+            "name": "Main",
+            "description": "General assistant with AiiDA process tools."
+          }
+        }
+      },
+      "browser": {
+        "enabled": true,
+        "headless": true,
+        "noSandbox": true,
+        "executablePath": "/bin/chromium",
+        "ssrfPolicy": {
+          "dangerouslyAllowPrivateNetwork": false,
+          "allowedHostnames": [
+            "example.org",
+            "@AIIDA_HOSTNAME@",
+            "@CLAW_HOSTNAME@"
+          ]
+        }
+      },
+      "discovery": {
+        "mdns": {
+          "mode": "off"
+        }
+      },
+      "gateway": {
+        "mode": "local",
+        "port": 18789,
+        "portals": {
+          "ingress": {
+            "domain": "@PORTAL_DOMAIN@",
+            "port": 18790
+          }
+        },
+        "bind": "custom",
+        "customBindHost": "0.0.0.0",
+        "publicOrigin": "https://@CLAW_HOSTNAME@",
+        "trustedProxies": [
+          "10.42.0.0/16"
+        ],
+        "controlUi": {
+          "allowedOrigins": [
+            "https://@CLAW_HOSTNAME@",
+            "http://127.0.0.1:18789",
+            "http://localhost:18789"
+          ]
+        },
+        "auth": {
+          "mode": "password",
+          "password": {
+            "source": "env",
+            "provider": "default",
+            "id": "OPENCLAW_GATEWAY_PASSWORD"
+          }
+        },
+        "terminal": {
+          "enabled": false
+        }
+      },
+      "mcp": {
+        "servers": {
+          "aiida": {
+            "enabled": true,
+            "transport": "streamable-http",
+            "url": "http://aiida-mcp.aiidalab.svc.cluster.local:8080/mcp",
+            "headers": {
+              "Authorization": "Bearer ${AIIDA_MCP_TOKEN}"
+            }
+          }
+        }
+      },
+      "memory": {
+        "citations": "auto",
+        "search": {
+          "enabled": true,
+          "provider": "none",
+          "sources": [
+            "memory",
+            "sessions"
+          ]
+        }
+      },
+      "models": {
+        "mode": "replace",
+        "catalogRefresh": {
+          "enabled": false
+        },
+        "providers": {
+          "bifrost": {
+            "api": "openai-completions",
+            "apiKey": {
+              "source": "env",
+              "provider": "default",
+              "id": "BIFROST_VK"
+            },
+            "baseUrl": "http://bifrost.bifrost.svc.cluster.local:8080/v1",
+            "models": [
+              {
+                "id": "claude-sonnet-5-5",
+                "name": "Claude Sonnet 5.5",
+                "reasoning": true,
+                "input": [
+                  "text",
+                  "image"
+                ],
+                "contextWindow": 200000,
+                "maxTokens": 64000,
+                "compat": {
+                  "supportsReasoningEffort": true,
+                  "supportedReasoningEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "max"
+                  ],
+                  "thinkingFormat": "openai"
+                }
+              },
+              {
+                "id": "claude-opus-5-5",
+                "name": "Claude Opus 5.5",
+                "reasoning": true,
+                "input": [
+                  "text",
+                  "image"
+                ],
+                "contextWindow": 200000,
+                "maxTokens": 64000,
+                "compat": {
+                  "supportsReasoningEffort": true,
+                  "supportedReasoningEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "max"
+                  ],
+                  "thinkingFormat": "openai"
+                }
+              },
+              {
+                "id": "claude-opus-5",
+                "name": "Claude Opus 5",
+                "reasoning": true,
+                "input": [
+                  "text",
+                  "image"
+                ],
+                "contextWindow": 200000,
+                "maxTokens": 64000,
+                "compat": {
+                  "supportsReasoningEffort": true,
+                  "supportedReasoningEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "max"
+                  ],
+                  "thinkingFormat": "openai"
+                }
+              },
+              {
+                "id": "claude-opus-4-8",
+                "name": "Claude Opus 4.8",
+                "reasoning": true,
+                "input": [
+                  "text",
+                  "image"
+                ],
+                "contextWindow": 200000,
+                "maxTokens": 64000,
+                "compat": {
+                  "supportsReasoningEffort": true,
+                  "supportedReasoningEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "max"
+                  ],
+                  "thinkingFormat": "openai"
+                }
+              },
+              {
+                "id": "claude-sonnet-5",
+                "name": "Claude Sonnet 5",
+                "reasoning": true,
+                "input": [
+                  "text",
+                  "image"
+                ],
+                "contextWindow": 200000,
+                "maxTokens": 64000,
+                "compat": {
+                  "supportsReasoningEffort": true,
+                  "supportedReasoningEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "max"
+                  ],
+                  "thinkingFormat": "openai"
+                }
+              },
+              {
+                "id": "claude-sonnet-4-6",
+                "name": "Claude Sonnet 4.6",
+                "reasoning": true,
+                "input": [
+                  "text",
+                  "image"
+                ],
+                "contextWindow": 200000,
+                "maxTokens": 64000,
+                "compat": {
+                  "supportsReasoningEffort": true,
+                  "supportedReasoningEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "max"
+                  ],
+                  "thinkingFormat": "openai"
+                }
+              },
+              {
+                "id": "claude-haiku-5-5",
+                "name": "Claude Haiku 5.5",
+                "reasoning": false,
+                "input": [
+                  "text",
+                  "image"
+                ],
+                "contextWindow": 200000,
+                "maxTokens": 32000
+              },
+              {
+                "id": "claude-haiku-4-5",
+                "name": "Claude Haiku 4.5",
+                "reasoning": true,
+                "input": [
+                  "text",
+                  "image"
+                ],
+                "contextWindow": 200000,
+                "maxTokens": 32000,
+                "compat": {
+                  "supportsReasoningEffort": true,
+                  "supportedReasoningEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "max"
+                  ],
+                  "thinkingFormat": "openai"
+                }
+              },
+              {
+                "id": "claude-fable-5",
+                "name": "Claude Fable 5",
+                "reasoning": true,
+                "input": [
+                  "text",
+                  "image"
+                ],
+                "contextWindow": 200000,
+                "maxTokens": 64000,
+                "compat": {
+                  "supportsReasoningEffort": true,
+                  "supportedReasoningEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "max"
+                  ],
+                  "thinkingFormat": "openai"
+                }
+              },
+              {
+                "id": "gemini-4-argon",
+                "name": "Gemini 4 Argon",
+                "reasoning": true,
+                "input": [
+                  "text",
+                  "image"
+                ],
+                "contextWindow": 1048576,
+                "maxTokens": 65536,
+                "compat": {
+                  "supportsReasoningEffort": true,
+                  "supportedReasoningEfforts": [
+                    "low",
+                    "medium",
+                    "high"
+                  ],
+                  "thinkingFormat": "openai"
+                }
+              },
+              {
+                "id": "gemini-3.8-flash",
+                "name": "Gemini 3.8 Flash",
+                "reasoning": true,
+                "input": [
+                  "text",
+                  "image"
+                ],
+                "contextWindow": 1048576,
+                "maxTokens": 65536,
+                "compat": {
+                  "supportsReasoningEffort": true,
+                  "supportedReasoningEfforts": [
+                    "low",
+                    "medium",
+                    "high"
+                  ],
+                  "thinkingFormat": "openai"
+                }
+              },
+              {
+                "id": "gemini-3.7-flash",
+                "name": "Gemini 3.7 Flash",
+                "reasoning": true,
+                "input": [
+                  "text",
+                  "image"
+                ],
+                "contextWindow": 1048576,
+                "maxTokens": 65536,
+                "compat": {
+                  "supportsReasoningEffort": true,
+                  "supportedReasoningEfforts": [
+                    "low",
+                    "medium",
+                    "high"
+                  ],
+                  "thinkingFormat": "openai"
+                }
+              },
+              {
+                "id": "gemini-3.6-flash",
+                "name": "Gemini 3.6 Flash",
+                "reasoning": true,
+                "input": [
+                  "text",
+                  "image"
+                ],
+                "contextWindow": 1048576,
+                "maxTokens": 65536,
+                "compat": {
+                  "supportsReasoningEffort": true,
+                  "supportedReasoningEfforts": [
+                    "low",
+                    "medium",
+                    "high"
+                  ],
+                  "thinkingFormat": "openai"
+                }
+              },
+              {
+                "id": "gemini-3.5-flash",
+                "name": "Gemini 3.5 Flash",
+                "reasoning": true,
+                "input": [
+                  "text",
+                  "image"
+                ],
+                "contextWindow": 1048576,
+                "maxTokens": 65536,
+                "compat": {
+                  "supportsReasoningEffort": true,
+                  "supportedReasoningEfforts": [
+                    "low",
+                    "medium",
+                    "high"
+                  ],
+                  "thinkingFormat": "openai"
+                }
+              },
+              {
+                "id": "gemini-3.5-flash-lite",
+                "name": "Gemini 3.5 Flash Lite",
+                "reasoning": true,
+                "input": [
+                  "text",
+                  "image"
+                ],
+                "contextWindow": 1048576,
+                "maxTokens": 65536,
+                "compat": {
+                  "supportsReasoningEffort": true,
+                  "supportedReasoningEfforts": [
+                    "low",
+                    "medium",
+                    "high"
+                  ],
+                  "thinkingFormat": "openai"
+                }
+              },
+              {
+                "id": "gemini-3.1-pro-preview",
+                "name": "Gemini 3.1 Pro (preview)",
+                "reasoning": true,
+                "input": [
+                  "text",
+                  "image"
+                ],
+                "contextWindow": 1048576,
+                "maxTokens": 65536,
+                "compat": {
+                  "supportsReasoningEffort": true,
+                  "supportedReasoningEfforts": [
+                    "low",
+                    "medium",
+                    "high"
+                  ],
+                  "thinkingFormat": "openai"
+                }
+              },
+              {
+                "id": "gemini-3.1-flash-lite",
+                "name": "Gemini 3.1 Flash Lite",
+                "reasoning": true,
+                "input": [
+                  "text",
+                  "image"
+                ],
+                "contextWindow": 1048576,
+                "maxTokens": 65536,
+                "compat": {
+                  "supportsReasoningEffort": true,
+                  "supportedReasoningEfforts": [
+                    "low",
+                    "medium",
+                    "high"
+                  ],
+                  "thinkingFormat": "openai"
+                }
+              },
+              {
+                "id": "gemini-3-flash-preview",
+                "name": "Gemini 3 Flash (preview)",
+                "reasoning": true,
+                "input": [
+                  "text",
+                  "image"
+                ],
+                "contextWindow": 1048576,
+                "maxTokens": 65536,
+                "compat": {
+                  "supportsReasoningEffort": true,
+                  "supportedReasoningEfforts": [
+                    "low",
+                    "medium",
+                    "high"
+                  ],
+                  "thinkingFormat": "openai"
+                }
+              },
+              {
+                "id": "gemini-2.5-pro",
+                "name": "Gemini 2.5 Pro",
+                "reasoning": true,
+                "input": [
+                  "text",
+                  "image"
+                ],
+                "contextWindow": 1048576,
+                "maxTokens": 65536,
+                "compat": {
+                  "supportsReasoningEffort": true,
+                  "supportedReasoningEfforts": [
+                    "low",
+                    "medium",
+                    "high"
+                  ],
+                  "thinkingFormat": "openai"
+                }
+              },
+              {
+                "id": "gemini-2.5-flash",
+                "name": "Gemini 2.5 Flash",
+                "reasoning": true,
+                "input": [
+                  "text",
+                  "image"
+                ],
+                "contextWindow": 1048576,
+                "maxTokens": 65536,
+                "compat": {
+                  "supportsReasoningEffort": true,
+                  "supportedReasoningEfforts": [
+                    "low",
+                    "medium",
+                    "high"
+                  ],
+                  "thinkingFormat": "openai"
+                }
+              },
+              {
+                "id": "gemini-2.5-flash-lite",
+                "name": "Gemini 2.5 Flash Lite",
+                "reasoning": true,
+                "input": [
+                  "text",
+                  "image"
+                ],
+                "contextWindow": 1048576,
+                "maxTokens": 65536,
+                "compat": {
+                  "supportsReasoningEffort": true,
+                  "supportedReasoningEfforts": [
+                    "low",
+                    "medium",
+                    "high"
+                  ],
+                  "thinkingFormat": "openai"
+                }
+              }
+            ]
+          }
+        }
+      },
+      "tools": {
+        "profile": "coding",
+        "fs": {
+          "workspaceOnly": true
+        }
+      },
+      "session": {
+        "maintenance": {
+          "mode": "enforce",
+          "pruneAfter": "30d"
+        }
+      },
+      "update": {
+        "auto": {
+          "enabled": false
+        },
+        "checkOnStart": false
+      },
+      "plugins": {
+        "enabled": true,
+        "deny": [
+          "acpx",
+          "cua-computer",
+          "canvas"
+        ]
+      },
+      "skills": {
+        "load": {
+          "extraDirs": [
+            "/etc/openclaw/skills"
+          ]
+        }
+      }
+    }

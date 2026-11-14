@@ -1,0 +1,203 @@
+# One compute node. slurmd is rootless (SlurmdUser=aiida): it can only launch
+# jobs as its own uid 1000, which is exactly the set of users that submits
+# through the sshd listener. Jobs write into /scratch/aiida (shared with the
+# controller) and use pw.x from the image.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: slurmd
+  namespace: slurm
+  labels:
+    app.kubernetes.io/name: slurm
+    app.kubernetes.io/component: compute01
+    app.kubernetes.io/part-of: aiidalab-openclaw-demo
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: slurm
+      app.kubernetes.io/component: compute01
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: slurm
+        app.kubernetes.io/component: compute01
+        app.kubernetes.io/part-of: aiidalab-openclaw-demo
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      hostname: compute01
+      subdomain: slurmd
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      initContainers:
+      - name: munge-key-setup
+        image: sandbox.local/slurm:26.05.5
+        imagePullPolicy: IfNotPresent
+        command: ["bash", "-c", "install -Dm0400 /munge-src/munge.key /var/munge-rt/munge/munge.key"]
+        securityContext:
+          runAsUser: 998
+          runAsGroup: 1000
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: [ALL]
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - name: munge-key
+          mountPath: /munge-src
+          readOnly: true
+        - name: munge-rt
+          mountPath: /var/munge-rt
+      # slurmd chmods its spool directory and must own it; the emptyDir itself
+      # belongs to root with only a group, so it gets a subdirectory of its own.
+      - name: spool-setup
+        image: sandbox.local/slurm:26.05.5
+        imagePullPolicy: IfNotPresent
+        command: ["bash", "-c", "install -d -m0755 /var/spool/slurmd/run"]
+        securityContext:
+          runAsUser: 1000
+          runAsGroup: 1000
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: [ALL]
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - name: slurm-spool
+          mountPath: /var/spool/slurmd
+      containers:
+      - name: munged
+        image: sandbox.local/slurm:26.05.5
+        imagePullPolicy: IfNotPresent
+        # Rotates this half of the key on its own; the controller pod runs the
+        # same wrapper, so a munge-key change no longer needs a hand-ordered
+        # restart of one pod before the other. See 05-slurm-scripts.yaml.
+        #
+        # --force: the pod emptyDir is group-writable by kubelet design, and
+        # munged treats every writable-but-not-sticky ancestor as a fatal error.
+        command: ["bash", "/etc/slurm-scripts/munged-supervisor.sh",
+          "munged", "-F", "--force",
+          "--socket=/var/munge-rt/munge/munge.socket.2",
+          "--key-file=/var/munge-rt/munge/munge.key",
+          "--pid-file=/var/munge-rt/munge/munged.pid",
+          "--seed-file=/var/munge-rt/munge/munged.seed",
+          "--log-file=/var/munge-rt/munge/munged.log",
+          "--num-threads=10"]
+        securityContext:
+          runAsUser: 998
+          runAsGroup: 1000
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: [ALL]
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - name: munge-rt
+          mountPath: /var/munge-rt
+        - name: munge-key
+          mountPath: /munge-src
+          readOnly: true
+        - name: slurm-scripts
+          mountPath: /etc/slurm-scripts
+          readOnly: true
+        readinessProbe:
+          exec:
+            command: ["test", "-S", "/var/munge-rt/munge/munge.socket.2"]
+          initialDelaySeconds: 3
+          periodSeconds: 5
+      - name: slurmd
+        image: sandbox.local/slurm:26.05.5
+        imagePullPolicy: IfNotPresent
+        command: ["slurmd", "-D", "-f", "/etc/slurm/slurm.conf"]
+        securityContext:
+          runAsUser: 1000
+          runAsGroup: 1000
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: [ALL]
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - name: slurm-conf
+          mountPath: /etc/slurm
+          readOnly: true
+        - name: munge-rt
+          mountPath: /var/munge-rt
+        - name: slurm-spool
+          mountPath: /var/spool/slurmd
+        - name: scratch
+          mountPath: /scratch
+        - name: tmp
+          mountPath: /tmp
+        # No cpu/memory limits on purpose: SLURM enforces per-job requests, a
+        # pod limit would silently cap every pw.x run.
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+        ports:
+        - name: slurmd
+          containerPort: 6818
+          protocol: TCP
+        readinessProbe:
+          exec:
+            command: ["bash", "-c", "kill -0 $(cat /var/spool/slurmd/slurmd.pid)"]
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          failureThreshold: 30
+      # slurmctld resolves NodeAddr once and keeps that address; after this pod
+      # is replaced the controller keeps pinging the address of the pod that is
+      # gone. The node then goes NOT_RESPONDING and then DOWN while jobs queue,
+      # even though slurmd here registers normally. The reconciler tells the
+      # controller where this pod actually is and resumes the node, so a slurmd
+      # restart heals itself. See 05-slurm-scripts.yaml.
+      - name: node-reconciler
+        image: sandbox.local/slurm:26.05.5
+        imagePullPolicy: IfNotPresent
+        command: ["bash", "/etc/slurm-scripts/node-reconciler.sh"]
+        securityContext:
+          runAsUser: 1000
+          runAsGroup: 1000
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: [ALL]
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - name: slurm-scripts
+          mountPath: /etc/slurm-scripts
+          readOnly: true
+        - name: slurm-conf
+          mountPath: /etc/slurm
+          readOnly: true
+        - name: munge-rt
+          mountPath: /var/munge-rt
+        - name: tmp
+          mountPath: /tmp
+        resources:
+          requests:
+            cpu: 10m
+            memory: 32Mi
+      volumes:
+      - name: munge-key
+        secret:
+          secretName: munge-key
+          defaultMode: 0400
+      - name: slurm-scripts
+        configMap:
+          name: slurm-scripts
+          defaultMode: 0555
+      - name: slurm-conf
+        configMap:
+          name: slurm-conf
+      - name: munge-rt
+        emptyDir: {}
+      - name: slurm-spool
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}
+      - name: scratch
+        persistentVolumeClaim:
+          claimName: slurm-scratch

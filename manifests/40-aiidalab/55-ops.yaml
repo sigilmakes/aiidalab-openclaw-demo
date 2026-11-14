@@ -1,0 +1,104 @@
+# Stable, idle pod for read-only AiiDA CLI work from the OpenClaw agent.
+# The agent reaches it with kubectl exec through the openclaw-ops Role; the
+# dynamic daemon pod is deliberately not a target. Submission stays on the
+# AiiDA MCP server.
+apiVersion: v1
+kind: Service
+metadata:
+  name: aiida-ops
+  namespace: aiidalab
+  labels:
+    app: aiida-ops
+spec:
+  clusterIP: None
+  selector:
+    app: aiida-ops
+  ports:
+    - name: none
+      port: 1
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: aiida-ops
+  namespace: aiidalab
+  labels:
+    app: aiida-ops
+spec:
+  serviceName: aiida-ops
+  replicas: 1
+  podManagementPolicy: OrderedReady
+  selector:
+    matchLabels:
+      app: aiida-ops
+  template:
+    metadata:
+      labels:
+        app: aiida-ops
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 0
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: ops
+          image: sandbox.local/aiidalab:26.10.0
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sleep", "infinity"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            readOnlyRootFilesystem: true
+          env:
+            - name: HOME
+              value: /home/aiida
+            - name: AIIDA_DB_HOST
+              value: aiidalab-postgres
+            - name: AIIDA_DB_PORT
+              value: "5432"
+            - name: AIIDA_RABBITMQ_HOST
+              value: aiidalab-rabbitmq
+            - name: AIIDA_RABBITMQ_PORT
+              value: "5672"
+            - name: PYTHONPATH
+              value: /opt/aiida-override
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+          volumeMounts:
+            - name: home
+              mountPath: /home/aiida
+            - name: slurm-key
+              mountPath: /etc/slurm-key
+              readOnly: true
+            - name: slurm-override
+              mountPath: /opt/aiida-override
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: home
+          persistentVolumeClaim:
+            claimName: aiidalab-home
+        - name: slurm-key
+          secret:
+            secretName: aiidalab-slurm
+            items:
+              - key: id_ed25519
+                path: id_ed25519
+            defaultMode: 0440
+        - name: slurm-override
+          configMap:
+            name: aiida-slurm-override
+        - name: tmp
+          emptyDir: {}

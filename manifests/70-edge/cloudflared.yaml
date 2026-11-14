@@ -1,0 +1,112 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+    name: cloudflared-ingress
+    namespace: edge
+data:
+    config.yml: |
+        # Closed by default: no hostnames are served. The `ingress-switch`
+        # package copies the open routes here for a demo window; every
+        # activation restores this catch-all config.
+        tunnel: @TUNNEL_ID@
+        credentials-file: /etc/cloudflared/creds/credentials.json
+        ingress:
+            - service: http_status:502
+---
+# DEVIATION from the reused file: replicas 2 with the default RollingUpdate
+# strategy (contract asks for 2; Recreate would drop to zero on every rollout).
+# DEVIATION: secret volume defaultMode 0440 plus fsGroup 65532 so the
+# runAsNonRoot cloudflared (uid/gid 65532) can read the credential; a plain
+# 0644 secret would be world-readable, and 0400 would be unreadable to it.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+    name: cloudflared
+    namespace: edge
+    labels:
+        app.kubernetes.io/name: cloudflared
+        app.kubernetes.io/component: edge-connector
+spec:
+    replicas: 2
+    selector:
+        matchLabels:
+            app.kubernetes.io/name: cloudflared
+    template:
+        metadata:
+            labels:
+                app.kubernetes.io/name: cloudflared
+        spec:
+            automountServiceAccountToken: false
+            securityContext:
+                runAsNonRoot: true
+                runAsUser: 65532
+                runAsGroup: 65532
+                fsGroup: 65532
+                seccompProfile:
+                    type: RuntimeDefault
+            containers:
+                - name: cloudflared
+                  image: docker.io/cloudflare/cloudflared:2026.10.6
+                  imagePullPolicy: IfNotPresent
+                  args:
+                    - tunnel
+                    - --config
+                    - /etc/cloudflared/config/config.yml
+                    - --metrics
+                    - 0.0.0.0:20241
+                    - --no-autoupdate
+                    - run
+                  env:
+                    - name: HOME
+                      value: /tmp
+                    - name: TMPDIR
+                      value: /tmp
+                  ports:
+                    - name: metrics
+                      containerPort: 20241
+                  readinessProbe:
+                    httpGet:
+                        path: /ready
+                        port: 20241
+                    initialDelaySeconds: 15
+                    periodSeconds: 10
+                    failureThreshold: 3
+                  livenessProbe:
+                    httpGet:
+                        path: /ready
+                        port: 20241
+                    initialDelaySeconds: 30
+                    periodSeconds: 30
+                    failureThreshold: 5
+                  resources:
+                    requests:
+                        cpu: 25m
+                        memory: 64Mi
+                    limits:
+                        cpu: 500m
+                        memory: 256Mi
+                  securityContext:
+                    allowPrivilegeEscalation: false
+                    readOnlyRootFilesystem: true
+                    capabilities:
+                        drop:
+                            - ALL
+                  volumeMounts:
+                    - name: config
+                      mountPath: /etc/cloudflared/config
+                      readOnly: true
+                    - name: credentials
+                      mountPath: /etc/cloudflared/creds
+                      readOnly: true
+                    - name: tmp
+                      mountPath: /tmp
+            volumes:
+                - name: config
+                  configMap:
+                    name: cloudflared-ingress
+                - name: credentials
+                  secret:
+                    secretName: cloudflared-credentials
+                    defaultMode: 0440
+                - name: tmp
+                  emptyDir: {}
