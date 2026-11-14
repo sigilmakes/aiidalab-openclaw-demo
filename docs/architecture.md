@@ -107,26 +107,57 @@ described in [provisioning.md](provisioning.md).
 
 ## Data flow
 
+The diagram shows the request paths between the components. The notes below add
+the mechanics.
+
+```mermaid
+flowchart LR
+    browser[Operator browser] --> access[Cloudflare Access]
+    access --> cfd[cloudflared]
+    cfd -->|18789| gw[OpenClaw gateway]
+    cfd -->|18791| portal[Portal relay]
+    cfd -->|8888| lab[AiiDAlab JupyterLab]
+
+    gw -->|8080| bf[Bifrost]
+    bf -->|443| vertex[Vertex AI]
+    gw -->|8080| mcp[aiida-mcp]
+    gw -.->|kubectl exec| ops[aiida-ops-0]
+
+    mcp --> daemon[AiiDA daemon]
+    daemon -->|8888| lab
+    daemon --> pg[(PostgreSQL)]
+    daemon --> mq[(RabbitMQ)]
+
+    subgraph slurm[slurm namespace]
+        ctl[slurmctld]
+        compute[compute01 slurmd]
+        cryo[cryoem-ops-0]
+        ctl --> compute
+        compute --> qe[pw.x]
+    end
+
+    daemon -->|"SSH 22"| ctl
+```
+
 1. **Operator to control UI.** A browser reaches `openclaw:18789` through a
     port-forward, or through `cloudflared` when the edge is open. The gateway
     asks for the password in `openclaw-gateway`.
-2. **Agent to models.** OpenClaw calls
+2. **Agent to models and AiiDA.** OpenClaw calls Bifrost at
     `http://bifrost.bifrost.svc.cluster.local:8080/v1` with the virtual key from
-    `bifrost-vk`. Bifrost resolves Vertex credentials and calls the regional
-    Vertex endpoint on 443.
-3. **Agent to AiiDA.** OpenClaw calls
+    `bifrost-vk`; Bifrost resolves Vertex credentials and calls the regional
+    Vertex endpoint on 443. For AiiDA it calls
     `http://aiida-mcp.aiidalab.svc.cluster.local:8080/mcp` with the bearer token
-    from `aiida-mcp-client`. `front.py` checks the token, `mcp-proxy` forwards
-    to the stdio server, and the server submits the process spec.
-4. **AiiDA to SLURM.** The daemon uploads the job over SSH to
+    from `aiida-mcp-client`. `front.py` checks the token, `mcp-proxy` forwards to
+    the stdio server, and the server submits the process spec.
+3. **AiiDA to SLURM.** The daemon uploads the job over SSH to
     `aiida@slurm.slurm.svc.cluster.local:22`, which lands on the controller
     pod's sshd at 2222. `sbatch` talks to `slurmctld` on 6817, which dispatches
     to `slurmd` on 6818. `pw.x` runs as uid 1000 and writes into `/scratch/aiida`.
-5. **Results back.** The daemon retrieves files into the AiiDA repository on the
+4. **Results back.** The daemon retrieves files into the AiiDA repository on the
     home claim. The MCP server writes a reproduction notebook through the Jupyter
     contents API on 8888, so the notebook appears in the AiiDAlab file browser
     under `notebooks/`.
-6. **Direct CLI work.** The agent runs `kubectl exec` into `aiida-ops-0`,
+5. **Direct CLI work.** The agent runs `kubectl exec` into `aiida-ops-0`,
     `slurmctld-0` or `cryoem-ops-0`. The request goes to the Kubernetes API on
     the node address, and the API server opens the exec stream.
 
@@ -135,7 +166,35 @@ foreground inside `cryoem-ops-0`, on the shared `/scratch/cryoem` claim.
 
 ## Delivery chain
 
-An activation runs four units in order.
+An activation runs four units in order. The diagram shows the hand-offs between
+them; the notes explain what each unit does.
+
+```mermaid
+sequenceDiagram
+    participant Nix as flake
+    participant Docker as host Docker
+    participant IMG as k3s-images
+    participant M as k3s-manifests
+    participant API as k3s API
+    participant Env as dotenv
+
+    Nix->>IMG: openclaw and slurm archives
+    IMG->>API: k3s ctr images import
+    Note right of IMG: fails if either image ref is missing
+    Docker->>API: build, save and import cryoem and aiidalab
+    Note right of Docker: skipped when the stamp file matches
+    Note over M: starts after both image units
+    M->>API: poll /readyz, up to 60 s
+    M->>API: apply 00-namespaces.yaml
+    M->>Env: read KEY=VALUE lines
+    M->>API: create Secrets
+    M->>API: apply 10-network-policy and 20-storage
+    M->>API: apply 35-slurm to 60-openclaw
+    opt ingress.enable
+        M->>API: apply 70-edge
+        M->>API: rollout restart cloudflared
+    end
+```
 
 1. **`k3s-images`** imports the two Nix-built image archives into the k3s
     containerd store with `k3s ctr images import`, then fails if either
@@ -227,6 +286,61 @@ credential that the Jupyter and MCP pods can read.
 egress in every namespace. Each workload directory then adds explicit allows.
 Policy is additive: a second allow policy for the same pods only widens what the
 first allows.
+
+The diagram shows the allowed edges between namespaces, plus the host firewall
+that sits under the cluster.
+
+```mermaid
+flowchart TB
+    subgraph host[host: single k3s node]
+        fw[host firewall: cni0 and flannel.1 trusted]
+
+        subgraph edge[edge: default-deny]
+            cfd[cloudflared]
+        end
+
+        subgraph openclaw[openclaw: default-deny]
+            gw[gateway 18789]
+            portal[portal relay 18791]
+        end
+
+        subgraph aiidalab[aiidalab: default-deny]
+            lab[JupyterLab 8888]
+            mcp[aiida-mcp 8080]
+            daemon[AiiDA daemon]
+        end
+
+        subgraph slurm[slurm: default-deny]
+            ctl[slurmctld]
+            cryo[cryoem-ops]
+        end
+
+        subgraph bifrost[bifrost: default-deny]
+            bf[bifrost 8080]
+        end
+
+        api[kube API 6443]
+    end
+
+    lan[LAN subnet] -.->|"8472, 10250, 6443 dropped"| fw
+    dns[kube-dns 53]
+    vertex[Vertex AI]
+
+    cfd -->|18789| gw
+    cfd -->|18791| portal
+    cfd -->|8888| lab
+    gw -->|8080| bf
+    bf -->|443| vertex
+    gw -->|8080| mcp
+    mcp --> daemon
+    daemon -->|"22, 2222, 6817"| ctl
+    gw -->|6443| api
+    gw -.->|53| dns
+```
+
+`cryoem-ops` has no edge of its own: the agent reaches it only through
+`kubectl exec`, which travels over the API path. Every namespace may reach
+`kube-dns` on 53.
 
 Ports in the policies are pod ports, because kube-router evaluates egress after
 DNAT. A Service port of 22 for SLURM is 2222 on the wire; a Service port of
