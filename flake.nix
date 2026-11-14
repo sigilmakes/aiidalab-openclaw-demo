@@ -63,7 +63,7 @@
                 secrets = pkgs.runCommand "aiidalab-openclaw-demo-check-secrets" {
                     nativeBuildInputs = [ pkgs.gitleaks ];
                 } ''
-                    gitleaks detect --no-git --source ${./.} --redact --exit-code 1 --no-banner
+                    gitleaks detect --no-git --source ${./.} --config ${./.gitleaks.toml} --redact --exit-code 1 --no-banner
                     touch $out
                 '';
             };

@@ -1,0 +1,6 @@
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Notebook filename assigned to a variable named token in example code"
+regexes = ['''^346-h2\.ipynb$''']
