@@ -55,7 +55,6 @@
             packages.${system} = {
                 openclaw-image = pkgs.callPackage ./images/openclaw.nix { inherit openclaw; };
                 slurm-image = pkgs.callPackage ./images/slurm.nix { };
-                ingress-switch = pkgs.callPackage ./packages/ingress-switch.nix { manifests = exampleManifests; };
             };
 
             checks.${system} = {
